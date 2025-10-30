@@ -1,0 +1,776 @@
+#+STARTUP: fold
+Analyze PCs across experiments. 
+
+* setup environment
+#+BEGIN_SRC elisp :session session
+(pyenv-mode-set "dynamax")
+#+END_SRC
+
+#+RESULTS:
+
+* imports
+#+BEGIN_SRC python :session session :async :tangle yes 
+import sys
+import glob
+sys.path.insert(0, "/Users/mjaragon/Documents/github/courtship_dynamics/")
+from src.utils.fictrac import *
+from src.utils.neural_data import *
+from src.utils.movies import *
+from src.utils.bootstrap import *
+from src.utils.regression import *
+from src.utils.tracking import *
+from src.utils.sliding_windows import *
+from src.utils.regression import *
+from src.utils.data_loading import * 
+from src.utils.clustering import * 
+from sklearn.decomposition import PCA
+import matplotlib.colors as mcolors
+import matplotlib.cm as cm
+import numpy as np
+from scipy.interpolate import RBFInterpolator
+import seaborn as sns
+from oasis.functions import deconvolve
+from pathlib import Path
+import statsmodels.api as sm
+
+# from functools import partial
+# import jax.numpy as jnp
+# import jax.random as jr
+# import matplotlib.pyplot as plt
+# from jax import vmap
+# from jax.nn import one_hot
+# from dynamax.hidden_markov_model import (
+#     CategoricalHMM,
+#     LogisticRegressionHMM,
+#     LinearRegressionHMM,
+# )
+# from dynamax.utils.plotting import CMAP, COLORS, white_to_color_cmap
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Td9tzh/python-nH4MFR
+
+* defs
+#+BEGIN_SRC python :session session :async :tangle yes 
+def splitTrainVal(data, seed=0, trainFrac=0.8):
+    np.random.seed(seed)
+    _, T, _ = data.shape
+    trainLen = int(trainFrac * T)
+    startIdx = np.random.randint(T)
+    stopIdx = (startIdx + trainLen) % T  # wrap
+
+    if startIdx < stopIdx:
+        trainIndices = np.arange(startIdx, stopIdx)
+    else:
+        trainIndices = np.concatenate((
+            np.arange(startIdx, T),
+            np.arange(0, stopIdx)
+        ))
+
+    valIndices = np.setdiff1d(np.arange(T), trainIndices)
+
+    return data[:, trainIndices], data[:, valIndices]
+
+def plot_gaussian_hmm_data(hmm, params, emissions, emissionNames, states, xlim=None):
+    """"Adapted from dynamax notebook"""
+    num_timesteps = len(emissions)
+    emission_dim = hmm.emission_dim
+    lim = 1.05 * abs(emissions).max()
+
+    # Plot the data superimposed on the generating state sequence
+    fig, axs = plt.subplots(emission_dim, 1, sharex=True)
+    
+    for d in range(emission_dim):    
+        axs[d].imshow(states[None, :], aspect="auto", interpolation="none", cmap=CMAP,
+                      vmin=0, vmax=len(COLORS) - 1, extent=(0, num_timesteps, -lim, lim))
+        axs[d].plot(emissions[:, d], "-k")
+        axs[d].set_ylabel(emissionNames[d], size=6)
+        
+    if xlim is None:
+        plt.xlim(0, num_timesteps)
+    else:
+        plt.xlim(xlim)
+
+    axs[-1].set_xlabel("time")
+    plt.tight_layout()
+    plt.show()
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Td9tzh/python-bWvlBw
+
+* define global variables (analysis directory)
+#+NAME: rootDir
+#+BEGIN_SRC emacs-lisp
+;; "/Users/mjaragon/Desktop/brain_analysis_data/functional/20240620/201/"
+"/Users/mjaragon/Desktop/brain_analysis_data/"
+#+END_SRC
+
+#+RESULTS: rootDir
+: /Users/mjaragon/Desktop/brain_analysis_data/
+
+#+RESULTS: expDir
+: /Users/mjaragon/Desktop/brain_analysis_data/functional/
+* check if PCs are consistent across flies
+** do PCA for each experiment
+#+BEGIN_SRC python :session session :async :tangle yes :var rootDir=rootDir
+from sklearn.decomposition import PCA
+
+explainedVars = []
+regressionCoefs = []
+expStrs = []
+nPCs = 10
+
+# bad experiments
+badExps = [
+    "20240606_101_func",
+    "20240606_202_func",
+    "20240606_102_func",
+    "20240618_201_func",
+    "20240618_101_func",
+    "20240618_102_func",
+    "20240612_201_func",
+    "20240623_201_func",
+    "20240617_401_func",
+    "20240617_201_func",
+    "20240609_101_func",
+    "20240610_201_func",
+    "20240610_101_func",
+]
+
+# grab experiment directories
+funcDirs = glob.glob(rootDir + "/**/*_func", recursive=True)
+expDirs = [str(Path(p).parents[0]) for p in funcDirs]
+
+for expDir in tqdm(expDirs):
+    if "07" in expDir or "20240530/101" in expDir or "20240530/102" in expDir:
+        continue
+    expStr = "_".join(expDir.split("/")[-2:]) + "_func"
+    if expStr in badExps:
+        continue
+
+    expStrs.append(expStr)
+    allNeuralData, idxToROI, roiToIdx = loadSupervoxelData(
+        expDir, channel=1, getRaw=True
+    )
+    flyvrData = loadFlyVRData(expDir)  # behavioral data
+    fsav = getFictracSampsAtVolume(flyvrData)  # fictrac samples for each imaging volume
+
+    # Prepare regression data
+    regressionData = makeRegressionData(
+        flyvrData=flyvrData,
+        cnnData=None,
+        fictracTimestamps=fsav,
+        calcMeanBetween=False,
+        featureList=["mfDistZ", "sideSideZ", "mRSZ", "mFSZ"],
+    )
+
+    # add some interaction terms
+    distMRS = regressionData["mfDistZ"] * regressionData["mRSZ"]
+    distMFS = regressionData["mfDistZ"] * regressionData["mFSZ"]
+    distSide = regressionData["mfDistZ"] * regressionData["sideSideZ"]
+    regressionData["distMRS"] = distMRS
+    regressionData["distMFS"] = distMFS
+    regressionData["distSide"] = distSide
+
+    # do pca on data
+    pca = PCA(n_components=nPCs)
+    pca.fit(allNeuralData.T)
+    components = pca.components_.T  # T x nPCs
+    transformed = []  # contains data projected onto each PC
+
+    # get pc loadings
+    loadings = pca.components_.T * np.sqrt(pca.explained_variance_)
+
+    # set sign of each PC s.t. mean of loadings is positive
+    for i in range(nPCs):
+        pc = components[:, i].copy()  # grab pc
+        if np.mean(loadings[:, i]) < 0:
+            pc *= -1  # flip sign if necessary
+        transformed.append(zscore(allNeuralData.T @ pc.T))  # data projected onto pc
+    transformed = np.array(transformed)  # update
+
+    # do regression on PCs
+    expCoefs = []
+    expVars = []
+
+    for pc in transformed:
+        XSimple = np.vstack([feat for featName, feat in regressionData.items()])
+        XCSimple = np.concatenate((np.ones(len(XSimple.T))[None, :], XSimple)).T
+        minLen = min(len(XCSimple), len(pc))
+        model = sm.OLS(pc[:minLen], XCSimple[:minLen]).fit()
+        params = model.params
+        varExp = pca.explained_variance_ratio_
+        expCoefs.append(params[1:])  # skip bias term
+        expVars.append(varExp)  # explained variance for each PC
+
+    # update coefficients
+    regressionCoefs.append(expCoefs)
+    explainedVars.append(varExp)
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Td9tzh/python-4gknUT
+** show parameter distributions for one pc
+#+BEGIN_SRC python :session session :async :tangle yes 
+# setup figure
+
+# make plot with signed coefs
+fig, ax = plt.subplots()
+
+# plot coefficients
+pcCoefs = np.array(regressionCoefs)[:, 0]
+featureList=["mfDistZ", "sideSideZ", "mRSZ", "mFSZ", "distMRS", "distMFS", "distSide"],
+sns.boxplot(data=pcCoefs, ax=ax, showfliers=False)
+sns.stripplot(data=pcCoefs, ax=ax, color="black")
+sns.despine(ax=ax)
+ax.set_title(f"PC1 regression coefficients")
+ax.set_xticklabels(*featureList, rotation=90)
+if i==0:
+    ax.set_ylabel("regression coefficient (a.u.)")
+plt.tight_layout()
+plt.show()
+
+
+# # make plot with absolute value coefs
+# fig, ax = plt.subplots()
+
+# # plot coefficients
+# pcCoefs = np.array(regressionCoefs)[:, 0]
+# featureList=["mfDistZ", "sideSideZ", "mRSZ", "mFSZ", "distMRS", "distMFS", "distSide"],
+# sns.boxplot(data=abs(pcCoefs), ax=ax, showfliers=False)
+# sns.stripplot(data=abs(pcCoefs), ax=ax, color="black")
+# sns.despine(ax=ax)
+# ax.set_title(f"PC1 regression coefficients")
+# ax.set_xticklabels(*featureList, rotation=90)
+# if i==0:
+#     ax.set_ylabel("regression coefficient (a.u.)")
+# plt.tight_layout()
+# plt.show()
+
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Td9tzh/python-NigccQ
+** show parameter distributions for each pc
+#+BEGIN_SRC python :session session :async :tangle yes 
+# setup figure
+nRows = 2
+nCols = nPCs // nRows
+nCols += nPCs % (nRows * nCols) 
+fig, ax = plt.subplots(nRows, nCols)
+
+# plot coefficients
+for i in range(nPCs):
+    idx = np.unravel_index(i, (nRows, nCols))
+    pcCoefs = np.array(regressionCoefs)[:, i]
+    featureList=["mfDistZ", "sideSideZ", "mRSZ", "mFSZ", "distMRS", "distMFS", "distSide"],
+    sns.boxplot(data=pcCoefs, ax=ax[idx], showfliers=False)
+    sns.stripplot(data=pcCoefs, ax=ax[idx], color="black")
+    sns.despine(ax=ax[idx])
+    ax[idx].set_title(f"PC{i+1}")
+    ax[idx].set_xticklabels(*featureList, rotation=90)
+    if i==0:
+        ax[idx].set_ylabel("regression coefficient (a.u.)")
+plt.tight_layout()
+plt.show()
+
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Td9tzh/python-HrAQqb
+** relationship between mfDist and other covariates 
+*** relationship between mfDist and mRS coefs
+#+BEGIN_SRC python :session session :async :tangle yes 
+# plt.hist(np.array(regressionCoefs)[:, 0, 0]); plt.show()  # sessions, pcs, features 
+from scipy.stats import ttest_rel
+
+# grab coefficients for different features
+mfDistCoefs = abs(np.array(regressionCoefs)[:, 0, 0])
+mRSCoefs = abs(np.array(regressionCoefs)[:, 0, 2])
+
+# separate coefs into high an low groups 
+whereLow = mRSCoefs<np.median(mRSCoefs)
+whereHigh = mRSCoefs>np.median(mRSCoefs)
+
+# run statistical tests 
+lowStats = ttest_rel(mfDistCoefs[whereLow], mRSCoefs[whereLow])  # experiments with low mfDist 
+highStats = ttest_rel(mfDistCoefs[whereHigh], mRSCoefs[whereHigh])  # experiments with high mfDist 
+print(lowStats)
+print(highStats)
+
+# format dataframe 
+fig, ax = plt.subplots(1, 2)
+highStatData = pd.DataFrame(data={"mRS": mRSCoefs[whereHigh], "mfDist": mfDistCoefs[whereHigh]})
+lowStatData = pd.DataFrame(data={"mRS": mRSCoefs[whereLow], "mfDist": mfDistCoefs[whereLow]})
+for i in range(sum(whereHigh)):
+    ax[0].plot([0, 1], [mRSCoefs[whereHigh][i], mfDistCoefs[whereHigh][i]], color="k")
+    ax[1].plot([0, 1], [mRSCoefs[whereLow][i], mfDistCoefs[whereLow][i]], color="k")
+sns.swarmplot(data=highStatData, ax=ax[0])
+sns.swarmplot(data=lowStatData, ax=ax[1])
+plt.show()
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Td9tzh/python-pFkxEf
+
+*** relationship between mfDist and mFS coefs
+#+BEGIN_SRC python :session session :async :tangle yes 
+# plt.hist(np.array(regressionCoefs)[:, 0, 0]); plt.show()  # sessions, pcs, features 
+from scipy.stats import ttest_rel
+
+# grab coefficients for different features
+mfDistCoefs = abs(np.array(regressionCoefs)[:, 0, 0])
+mFSCoefs = abs(np.array(regressionCoefs)[:, 0, 3])
+
+# separate coefs into high an low groups 
+whereLow = mFSCoefs<np.median(mFSCoefs)
+whereHigh = mFSCoefs>np.median(mFSCoefs)
+
+# run statistical tests 
+lowStats = ttest_rel(mfDistCoefs[whereLow], mFSCoefs[whereLow])  # experiments with low mfDist 
+highStats = ttest_rel(mfDistCoefs[whereHigh], mFSCoefs[whereHigh])  # experiments with high mfDist 
+print(highStats)
+print(lowStats)
+
+# format dataframe 
+fig, ax = plt.subplots(1, 2)
+highStatData = pd.DataFrame(data={"mFS": mFSCoefs[whereHigh], "mfDist": mfDistCoefs[whereHigh]})
+lowStatData = pd.DataFrame(data={"mFS": mFSCoefs[whereLow], "mfDist": mfDistCoefs[whereLow]})
+for i in range(sum(whereHigh)):
+    ax[0].plot([0, 1], [mFSCoefs[whereHigh][i], mfDistCoefs[whereHigh][i]], color="k")
+    ax[1].plot([0, 1], [mFSCoefs[whereLow][i], mfDistCoefs[whereLow][i]], color="k")
+    sns.despine(ax=ax[0])
+    sns.despine(ax=ax[1])
+    ax[0].set_ylabel("coefficient magnitude (a.u.)")
+    ax[0].set_title("high speed coefs")
+    ax[1].set_title("low speed coefs")
+
+sns.swarmplot(data=highStatData, ax=ax[0])
+sns.swarmplot(data=lowStatData, ax=ax[1])
+plt.show()
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Td9tzh/python-NsQ3r2
+
+*** relationship between mfDist and sideSide coefs
+#+BEGIN_SRC python :session session :async :tangle yes 
+# plt.hist(np.array(regressionCoefs)[:, 0, 0]); plt.show()  # sessions, pcs, features 
+from scipy.stats import ttest_rel
+
+# grab coefficients for different features
+mfDistCoefs = abs(np.array(regressionCoefs)[:, 0, 0])
+sideSideCoefs = abs(np.array(regressionCoefs)[:, 0, 1])
+
+# separate coefs into high an low groups 
+whereLow = sideSideCoefs<np.median(sideSideCoefs)
+whereHigh = sideSideCoefs>np.median(sideSideCoefs)
+
+# run statistical tests 
+lowStats = ttest_rel(mfDistCoefs[whereLow], sideSideCoefs[whereLow])  # experiments with low mfDist 
+highStats = ttest_rel(mfDistCoefs[whereHigh], sideSideCoefs[whereHigh])  # experiments with high mfDist 
+print(lowStats)
+print(highStats)
+
+# format dataframe 
+fig, ax = plt.subplots(1, 2)
+highStatData = pd.DataFrame(data={"sideSide": sideSideCoefs[whereHigh], "mfDist": mfDistCoefs[whereHigh]})
+lowStatData = pd.DataFrame(data={"sideSide": sideSideCoefs[whereLow], "mfDist": mfDistCoefs[whereLow]})
+for i in range(sum(whereHigh)):
+    ax[0].plot([0, 1], [sideSideCoefs[whereHigh][i], mfDistCoefs[whereHigh][i]], color="k")
+    ax[1].plot([0, 1], [sideSideCoefs[whereLow][i], mfDistCoefs[whereLow][i]], color="k")
+sns.swarmplot(data=highStatData, ax=ax[0])
+sns.swarmplot(data=lowStatData, ax=ax[1])
+plt.show()
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Td9tzh/python-ONjmol
+
+*** find experiment names corresponding to high and low speed coefs
+#+BEGIN_SRC python :session session :async :tangle yes 
+expDirNames = [str(Path(p).parents[0]) for p in funcDirs]
+expDirNames = np.array([
+    p
+    for p in expDirNames
+    if "07" not in p and "20240530/101" not in p and "20240530/102" not in p
+])
+expDirNames[whereLow]
+print(expDirNames)
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Td9tzh/python-iNg2pJ
+
+*** examine relationship between PC1 mfSpeed coefs and behavioral mfSpeed
+Could be that experiments with low mfSpeed encoding correspond to those with lower overall levels of mfSpeed, rather than PC1 encoding less speed despite speed levels being robust.
+
+**** load behavioral data 
+#+BEGIN_SRC python :session session :async :tangle yes 
+# grab experiment directories
+funcDirs = glob.glob(rootDir + "/**/*_func", recursive=True)
+expDirs = [str(Path(p).parents[0]) for p in funcDirs]
+
+# grab data across experiments
+allMFS = []
+allMRS = []
+for expDir in tqdm(expDirs):
+    if "07" in expDir or "20240530/101" in expDir or "20240530/102" in expDir:
+        continue
+    expStr = "_".join(expDir.split("/")[-2:]) + "_func"
+    if expStr in badExps:
+        continue
+
+    flyvrData = loadFlyVRData(expDir)  # behavioral data
+    fsav = getFictracSampsAtVolume(flyvrData)  # fictrac samples for each imaging volume
+
+    # Prepare regression data
+    regressionData = makeRegressionData(
+        flyvrData=flyvrData,
+        cnnData=None,
+        fictracTimestamps=fsav,
+        calcMeanBetween=False,
+        featureList=["mFS", "mRS"],
+    )
+
+    # get male forward speed
+    mFS = abs(regressionData["mFS"])
+    mRS = abs(regressionData["mRS"])
+    allMFS.append(mFS)
+    allMRS.append(mRS)
+
+
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Td9tzh/python-LZYAfx
+
+**** examine relationship between mfDist and male forward speed
+#+BEGIN_SRC python :session session :async :tangle yes 
+def minMaxScale(target, reference):
+    minTarget, maxTarget = np.min(target), np.max(target)
+    minRef, maxRef = np.min(reference), np.max(reference)
+
+    return np.array(
+        [
+            (x - minTarget) / (maxTarget - minTarget) * (maxRef - minRef) + minRef
+            for x in target
+        ]
+    )
+def scale01(target):
+    minTarget, maxTarget = np.min(target), np.max(target)
+    return np.array([(x-minTarget)/(maxTarget-minTarget) for x in target])
+
+from scipy.stats import spearmanr
+muMFS = np.array([np.mean(x) for x in allMFS])
+print(spearmanr(muMFS, mFSCoefs))  # test hypothesis that male speed and mFS encoding coefs. are correlated
+print(spearmanr(muMFS, mfDistCoefs))  # test hypothesis that male speed and mFS encoding coefs. are correlated
+
+fig, ax = plt.subplots(1,2)
+ax[0].scatter(muMFS, mFSCoefs)
+ax[1].scatter(muMFS, mfDistCoefs)
+ax[0].set_xlabel("average male forward speed")
+ax[0].set_ylabel("PC1 mFS coefs")
+ax[1].set_xlabel("average male forward speed")
+ax[1].set_ylabel("PC1 mfDist coefs")
+sns.despine(ax=ax[0])
+sns.despine(ax=ax[1])
+plt.tight_layout()
+plt.show()
+
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Td9tzh/python-mrVLho
+
+** relationship between mfDist coefs, mFS coefs, and male forward tracking
+**** load behavioral data 
+#+BEGIN_SRC python :session session :async :tangle yes 
+del sys.modules["src.utils.regression"]
+from src.utils.regression import makeRegressionData
+from scipy.stats import pearsonr 
+
+# grab experiment directories
+funcDirs = glob.glob(rootDir + "/**/*_func", recursive=True)
+expDirs = [str(Path(p).parents[0]) for p in funcDirs]
+
+# grab data across experiments
+forwardTracking = []
+for expDir in tqdm(expDirs):
+    if "07" in expDir or "20240530/101" in expDir or "20240530/102" in expDir:
+        continue
+    expStr = "_".join(expDir.split("/")[-2:])
+    flyvrData = loadFlyVRData(expDir)  # behavioral data
+    fsav = getFictracSampsAtVolume(flyvrData)  # fictrac samples for each imaging volume
+
+    # Prepare regression data
+    regressionData = makeRegressionData(
+        flyvrData=flyvrData,
+        cnnData=None,
+        fictracTimestamps=fsav,
+        calcMeanBetween=False,
+        featureList=["mFS", "mRS", "mfDist", "mFV"],
+    )
+
+    # get male forward speed
+    mFS = abs(regressionData["mFS"])
+    mFV = regressionData["mFV"]
+    mRS = abs(regressionData["mRS"])
+    mfDist = regressionData["mfDist"]
+    forwardTracking.append(pearsonr(mFV, mfDist)[0])
+
+
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Td9tzh/python-nix31V
+* predict courtship state from pc coefficients
+** define courtship state dict
+Define dictionary that specifies whether a fly showed courtship behavior (tapping, wing extension, tapping) during the experiment. Refer to [[id:FC20E7A7-DFDC-4F1D-8BFB-09AD98EC2EA3][behavioral summary]]. 
+#+BEGIN_SRC python :session session :async :tangle yes 
+stateDict = {
+    "20240530_201": 1,
+    "20240605_101": 0,
+    "20240605_102": 1,
+    "20240606_101": 0,
+    "20240606_102": 0,
+    "20240606_201": 0,
+    "20240606_202": 0,
+    "20240609_101": 0,
+    "20240610_101": 1,
+    "20240610_201": 0,
+    "20240611_101": 0,
+    "20240611_201": 0,
+    "20240612_101": 1,
+    "20240612_201": 0,
+    "20240617_101": 1,
+    "20240617_201": 1,
+    "20240617_301": 0,
+    "20240617_401": 0,
+    "20240618_101": 1,
+    "20240618_102": 1,
+    "20240618_201": 1,
+    "20240620_101": 1,
+    "20240620_201": 1,
+    "20240623_101": 1,
+    "20240623_201": 1,
+    "20240625_101": 1,
+    "20240625_201": 0,
+    "20240629_101": 0,
+    "20240629_201": 1,
+    "20240629_301": 0,
+}
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Td9tzh/python-zrrq2m
+
+** build regression model mapping PC regression coefficients -> courtship state
+#+BEGIN_SRC python :session session :async :tangle yes 
+from imblearn.over_sampling import RandomOverSampler as ROS
+from imblearn.under_sampling import RandomUnderSampler as RUS
+from sklearn.linear_model import LogisticRegression
+
+# build coefficient dictionary
+nTrain = int(len(stateDict) * 0.7)
+scores = []
+nFeatures = 7
+for fold in range(100):
+    np.random.seed(fold)
+    randInds = np.arange(len(stateDict))
+    indsTrain, indsVal = randInds[:nTrain], randInds[nTrain:]
+    np.random.shuffle(randInds)
+    XTrain = np.array(
+        [x[0][:nFeatures] for x in np.array(regressionCoefs)[indsTrain]]
+    )  # regression coefs for first PC
+    YTrain = np.array(list(stateDict.values()))[indsTrain]
+    ros = ROS()
+    XRes, YRes = ros.fit_resample(XTrain, YTrain)
+    clf = LogisticRegression(random_state=0, C=0.01).fit(XRes, YRes)
+
+    # evaluate model
+    rus = RUS()
+    XVal = np.array(
+        [x[0][:nFeatures] for x in np.array(regressionCoefs)[indsVal]]
+    )  # regression coefs for first PC
+    YVal = np.array(list(stateDict.values()))[indsVal]
+
+    if len(np.unique(YVal)) == 1:
+        continue
+
+    XVal, YVal = rus.fit_resample(XVal, YVal)
+    score = clf.score(XVal, YVal)
+    scores.append(score)
+
+print(np.mean(scores))
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Td9tzh/python-IjvLkb
+
+* legacy
+** plot PC coefficient correlations 
+#+BEGIN_SRC python :session session :async :tangle yes 
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+# compute correlation between coefficients across experiments
+coefMats = []
+nCols = 2
+nRows = nPCs//nCols
+if nPCs%nCols > 0:
+    nRows += 1
+fig, ax = plt.subplots(nRows, nCols, sharey=True, figsize=(6, 10))
+for i in range(nPCs):  # iterate over each PC dimension
+    axIdx = np.unravel_index(i, (nRows, nCols))
+    regressionCoefsFlat = np.array(regressionCoefs)[:, i]
+    corrCoefs = abs(np.corrcoef(regressionCoefsFlat))
+    coefMats.append(corrCoefs)
+    im = ax[axIdx].imshow(corrCoefs)
+    ax[axIdx].axis("off")
+    ax[axIdx].set_title(f"PC {}")
+
+divider = make_axes_locatable(ax[-1, -1])
+cax = divider.append_axes('right', size='5%', pad=0.05)
+fig.colorbar(im, cax=cax, orientation='vertical', label="corr coef")
+plt.suptitle("PC regression coeff correlations")
+plt.tight_layout()
+plt.show()
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Ghj6zF/python-B8U95B
+** compare correlation coefficients to randomly shuffled coefficients
+#+BEGIN_SRC python :session session :async :tangle yes 
+nFolds = 1000
+trueCorrMeans = [np.mean(x[~np.eye(len(x), dtype=bool)]) for x in coefMats]
+pVals = []
+for i in range(len(coefMats)):  # n pcs
+    nullCorrMeans = []  # null correlation means
+    for ii in range(nFolds):
+        np.random.seed(ii)
+        coefShape = np.array(regressionCoefs)[
+            :, i
+        ].shape  # 30 x 4 (30 experiments, 4 regressors)
+        coefShuff = np.ravel(np.array(regressionCoefs.copy())[:, i])
+        np.random.shuffle(coefShuff)  # shuffle the regression coefs across experiments
+        coefShuff = np.reshape(
+            coefShuff, coefShape
+        )  # give the coefs their original shape
+        corShuff = abs(np.corrcoef(coefShuff))  # only consider magnitude 
+        nullCorrMeans.append(np.mean(corShuff[~np.eye(len(corShuff), dtype=bool)]))
+
+    empiricalP = (np.sum(np.array(nullCorrMeans) >= trueCorrMeans[i]) + 1) / (
+        nFolds + 1
+    )  # empirical p values
+    pVals.append(empiricalP)
+
+print(np.round(pVals, 3))
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Ghj6zF/python-CzsSCj
+** compare explained variance ratio across experiments
+#+BEGIN_SRC python :session session :async :tangle yes 
+# plot explained variance
+fig, ax = plt.subplots()
+ax.plot(np.array(explainedVars).T)
+ax.set_xlabel("PC")
+ax.set_ylabel("explained variance")
+ax.set_xticks(np.arange(nPCs))
+ax.set_xticklabels(np.arange(nPCs) + 1)
+sns.despine(ax=ax)
+plt.show()
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Ghj6zF/python-TdopGT
+
+#+END_SRC
+
+** relationship between sideSide and other covariates 
+*** relationship between sideSide and mRS coefs
+#+BEGIN_SRC python :session session :async :tangle yes 
+# plt.hist(np.array(regressionCoefs)[:, 0, 0]); plt.show()  # sessions, pcs, features 
+from scipy.stats import ttest_rel
+
+# grab coefficients for different features
+sideSide = abs(np.array(regressionCoefs)[:, 0, 1])
+mRSCoefs = abs(np.array(regressionCoefs)[:, 0, 2])
+
+# separate coefs into high an low groups 
+whereLow = mRSCoefs<np.median(mRSCoefs)
+whereHigh = mRSCoefs>np.median(mRSCoefs)
+
+# run statistical tests 
+highStats = ttest_rel(sideSideCoefs[whereHigh], mRSCoefs[whereHigh])  # experiments with high mfDist 
+lowStats = ttest_rel(sideSideCoefs[whereLow], mRSCoefs[whereLow])  # experiments with low mfDist 
+print(highStats)
+print(lowStats)
+
+# format dataframe 
+fig, ax = plt.subplots(1, 2)
+highStatData = pd.DataFrame(data={"mRS": mRSCoefs[whereHigh], "side-side": sideSideCoefs[whereHigh]})
+lowStatData = pd.DataFrame(data={"mRS": mRSCoefs[whereLow], "side-side": sideSideCoefs[whereLow]})
+for i in range(sum(whereHigh)):
+    ax[0].plot([0, 1], [mRSCoefs[whereHigh][i], sideSideCoefs[whereHigh][i]], color="k")
+    ax[1].plot([0, 1], [mRSCoefs[whereLow][i], sideSideCoefs[whereLow][i]], color="k")
+sns.swarmplot(data=highStatData, ax=ax[0])
+sns.swarmplot(data=lowStatData, ax=ax[1])
+plt.show()
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Td9tzh/python-0kKvxu
+
+*** relationship between sideSide and mFS coefs
+#+BEGIN_SRC python :session session :async :tangle yes 
+# plt.hist(np.array(regressionCoefs)[:, 0, 0]); plt.show()  # sessions, pcs, features 
+from scipy.stats import ttest_rel
+
+# grab coefficients for different features
+sideSide = abs(np.array(regressionCoefs)[:, 0, 1])
+mFSCoefs = abs(np.array(regressionCoefs)[:, 0, 3])
+# sideSide = abs(zscore(regressionCoefs)[:, 0, 1])
+# sideSide = abs(zscore(regressionCoefs)[:, 0, 3])
+
+# separate coefs into high an low groups 
+whereLow = mFSCoefs<np.median(mFSCoefs)
+whereHigh = mFSCoefs>np.median(mFSCoefs)
+
+# run statistical tests 
+highStats = ttest_rel(sideSideCoefs[whereHigh], mFSCoefs[whereHigh])  # experiments with high mfDist 
+lowStats = ttest_rel(sideSideCoefs[whereLow], mFSCoefs[whereLow])  # experiments with low mfDist 
+print(highStats)
+print(lowStats)
+
+# format dataframe 
+fig, ax = plt.subplots(1, 2)
+highStatData = pd.DataFrame(data={"mFS": mFSCoefs[whereHigh], "side-side": sideSideCoefs[whereHigh]})
+lowStatData = pd.DataFrame(data={"mFS": mFSCoefs[whereLow], "side-side": sideSideCoefs[whereLow]})
+for i in range(sum(whereHigh)):
+    ax[0].plot([0, 1], [mFSCoefs[whereHigh][i], sideSideCoefs[whereHigh][i]], color="k")
+    ax[1].plot([0, 1], [mFSCoefs[whereLow][i], sideSideCoefs[whereLow][i]], color="k")
+sns.swarmplot(data=highStatData, ax=ax[0])
+sns.swarmplot(data=lowStatData, ax=ax[1])
+plt.show()
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Td9tzh/python-5Sc0Fq
+
+*** find experiment names corresponding to high and low speed coefs
+#+BEGIN_SRC python :session session :async :tangle yes 
+expDirNames = [str(Path(p).parents[0]) for p in funcDirs]
+expDirNames = np.array([
+    p
+    for p in expDirNames
+    if "07" not in p and "20240530/101" not in p and "20240530/102" not in p
+])
+expDirNames[whereLow]
+print(expDirNames[whereLow])
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Td9tzh/python-FQnmtb
+

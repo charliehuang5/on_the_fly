@@ -1,0 +1,82 @@
+* set up environment
+#+BEGIN_SRC elisp :session session_quality
+(pyenv-mode-set "brain_tools")
+#+END_SRC
+
+#+RESULTS:
+
+* get recording quality
+#+BEGIN_SRC python :session session_quality :async :tangle yes 
+qualityDict = {
+    "20240606_201_func": 0.9993169726904595,
+    "20240606_101_func": 0.49616222693910195,
+    "20240606_202_func": 0.526312283125801,
+    "20240606_102_func": 0.6133463910580101,
+    "20240704_101_func": 0.9996381104492921,
+    "20240530_201_func": 0.8406742537256034,
+    "20240530_101_func": 0.964183706384897,
+    "20240530_102_func": 0.9806272512564533,
+    "20240625_201_func": 0.9995891368124367,
+    "20240625_101_func": 0.7982892377099359,
+    "20240620_201_func": 0.7344599135734611,
+    "20240618_201_func": 0.4868833655925521,
+    "20240618_101_func": 0.6049752181785689,
+    "20240618_102_func": 0.5326849109688803,
+    "20240611_201_func": 0.8034175431109039,
+    "20240611_101_func": 0.9210091184725412,
+    "20240612_201_func": 0.37320923243810367,
+    "20240612_101_func": 0.745251093307802,
+    "20240629_301_func": 0.7738987659071307,
+    "20240629_201_func": 0.7953000906999989,
+    "20240629_101_func": 0.884076372225509,
+    "20240620_101_func": 0.9997304121812474,
+    "20240605_101_func": 0.9347830160948931,
+    "20240605_102_func": 0.8646201241419955,
+    "20240703_101_func": 0.9996190229602354,
+    "20240623_201_func": 0.5175760539824099,
+    "20240623_101_func": 0.7618843406455288,
+    "20240617_401_func": 0.5985425978388855,
+    "20240617_301_func": 0.9246236221515451,
+    "20240617_201_func": 0.44128890933386505,
+    "20240617_101_func": 0.7927821246612049,
+    "20240609_101_func": 0.5532117894274392,
+    "20240610_201_func": 0.4449760512295044,
+    "20240610_101_func": 0.5799848098273384,
+}
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Td9tzh/python-g4agN8
+
+* imports
+#+BEGIN_SRC python :session session_quality :async :tangle yes 
+import seaborn as sns
+from matplotlib import pyplot as plt 
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Td9tzh/python-XXxZlA
+
+
+* make plot
+#+BEGIN_SRC python :session session_quality :async :tangle yes 
+fig, ax = plt.subplots()
+plt.hist(qualityDict.values(), bins=15)
+ax.set_xlabel("fraction unique variance")
+ax.set_ylabel("# sessions")
+sns.despine(ax=ax)
+plt.show()
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Td9tzh/python-ddMJcG
+
+* sessions with explained var greater than cutoff
+#+BEGIN_SRC python :session session_quality :async :tangle yes 
+varCutoff = 0.7
+goodSessions = [key for key, val in qualityDict.items() if val > 0.7]
+badSessions = [key for key, val in qualityDict.items() if val < 0.7]
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Td9tzh/python-P7Wn4l

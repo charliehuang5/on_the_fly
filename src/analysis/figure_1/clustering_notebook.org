@@ -1,0 +1,582 @@
+#+STARTUP: fold
+The aim of this notebook is to see if there is any epoch-dependence is response properties. 
+
+* results
+- mfDist response properties may change across epochs. [[id:53076FF3-531C-44D2-9ABA-4E11F0F44667][find changes in tuning]]
+* agenda [1/1]
+- [X] compare tuning differences split across epochs with those obtained through random folds
+- [ ] amplitude differences across epochs
+
+* setup environment
+#+BEGIN_SRC elisp :session session
+(pyenv-mode-set "brain_tools")
+#+END_SRC
+
+#+RESULTS:
+
+* imports
+#+BEGIN_SRC python :session session :async :tangle yes 
+import sys
+import glob
+sys.path.insert(0, "/Users/mjaragon/Documents/github/courtship_dynamics/")
+from src.utils.fictrac import *
+from src.utils.neural_data import *
+from src.utils.movies import *
+from src.utils.bootstrap import *
+from src.utils.regression import *
+from src.utils.tracking import *
+from src.utils.sliding_windows import *
+from src.utils.regression import *
+from src.utils.data_loading import * 
+from src.utils.clustering import * 
+from sklearn.decomposition import PCA
+import matplotlib.colors as mcolors
+import matplotlib.cm as cm
+import numpy as np
+from scipy.interpolate import RBFInterpolator
+import seaborn as sns
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-xUtn2b/python-Q0okPa
+* define global variables (analysis directory)
+#+NAME: expDir
+#+BEGIN_SRC emacs-lisp
+"/Users/mjaragon/Desktop/brain_analysis_data/functional/20240620/201/"
+#+END_SRC
+
+#+RESULTS: expDir
+: /Users/mjaragon/Desktop/brain_analysis_data/functional/20240620/201/
+* load data 
+#+BEGIN_SRC python :session session :async :tangle yes :var expDir=expDir
+del sys.modules["src.utils.data_loading"]
+from src.utils.data_loading import loadSupervoxelData
+allNeuralData, idxToROI, roiToIdx = loadSupervoxelData(expDir)
+flyvrData = loadFlyVRData(expDir)
+cnnData = loadCNNPredictions(expDir)
+fsav = getFictracSampsAtVolume(flyvrData)  # fictrac samples for each imaging volume
+
+# Prepare regression data
+regressionData = makeRegressionData(
+    flyvrData=flyvrData,
+    cnnData=cnnData,
+    fictracTimestamps=fsav,
+    calcMeanBetween=False
+)
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-xUtn2b/python-RCzIvo
+* run regression
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-StucAr/python-VNVtCV
+
+#+BEGIN_SRC python :session session :async :tangle yes 
+regressionDataSimple = {
+    k: v
+    for k, v in regressionData.items()
+    if k in ["mfDistZ", "sideSideLX", "sideSideRX", "mRSZ", "mFSZ"]
+}
+regressionResults = runRegression(regressionDataSimple, allNeuralData, cutoff=0.05)
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-xUtn2b/python-ERyikk
+
+* functional clustering
+** cluster across all time 
+*** side-side
+**** get back-forth cycles
+#+BEGIN_SRC python :session session :async :tangle yes 
+from scipy.signal import find_peaks, resample
+
+sideSide = regressionData["sideSide"]  # backnforth stim
+cyclePeaksPos, _ = find_peaks(np.where(sideSide > 0, 1, 0))
+cyclePeaksNeg, _ = find_peaks(np.where(sideSide > 0, 0, 1))
+cyclePeaks = np.sort(list(cyclePeaksPos) + list(cyclePeaksNeg))
+periods = [
+    (cyclePeaks[i * 2], cyclePeaks[i * 2 + 2])
+    for i in range(len(cyclePeaks))
+    if i * 2 + 2 < len(cyclePeaks)
+]
+
+# plt.plot(sideSide)
+# plt.scatter(cyclePeaks, sideSide[cyclePeaks], color = 'r')
+# plt.show()
+# print(periods)
+
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-MFfiiR/python-PaHQxW
+
+**** side-side motion averaged across trials 
+#+BEGIN_SRC python :session session :async :tangle yes 
+sideSideActivity = allNeuralData[regressionResults["sigMod"]["sideSideZ"]]
+sideSideChunks = [resampleRows([x[t0:t1+1] for t0, t1 in periods], 100) for x in sideSideActivity]
+sideSideMeans = np.mean(sideSideChunks, axis=1)
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-MFfiiR/python-ZIzv9b
+
+**** side-side stimulus averaged across trials 
+#+BEGIN_SRC python :session session :async :tangle yes 
+sideSideStimChunks = resampleRows([sideSide[t0:t1+1] for t0, t1 in periods], 100)
+sideSideStimMean = np.mean(sideSideStimChunks, axis=0)
+# fig, ax = plt.subplots()
+# plt.plot(sideSideStimMean)
+# plt.show()
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-MFfiiR/python-HfNW5A
+
+**** cluster response types across ROIs
+#+BEGIN_SRC python :session session :async :tangle yes :eval no
+del sys.modules["src.utils.clustering"]
+from src.utils.clustering import groupByLabel
+
+# get labels 
+# sideSideMeansZ = zscore(sideSideMeans, axis=1, nan_policy="omit")
+# sideSideMask = ~np.isnan(np.sum(sideSideMeansZ, axis=1))
+# sideSideLabels = cluster_and_plot_functional_data(sideSideMeansZ[sideSideMask], percentile=99.9, featName="side-side", doPlot=False)
+sideSideLabels = cluster_and_plot_functional_data(sideSideMeans, percentile=99.9, featName="side-side", doPlot=False)
+
+# make plot 
+# sideSideResponsesGrouped = groupByLabel(sideSideMeansZ[sideSideMask], labels=sideSideLabels)
+sideSideResponsesGrouped = groupByLabel(sideSideMeans, labels=sideSideLabels)
+fig, ax = plt.subplots()
+ax.imshow(sideSideResponsesGrouped, aspect="auto", vmin=0, vmax=1)
+plt.show()
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-KBUVCW/python-hidc1f
+
+*** mfDist 
+**** find large changes in mfDist 
+#+BEGIN_SRC python :session session :async :tangle yes 
+deltaThresh = -1
+mfDist = list(regressionData["mfDist"])
+fFV = np.diff([0] + mfDist)
+fFVBinary = np.where(fFV < deltaThresh , 1, 0)  # 1mm / time step
+distEvents, _ = label(fFVBinary)
+uniqueEvents = np.unique(distEvents[distEvents > 0])
+eventInds = np.squeeze([np.argwhere(distEvents == l)[0] for l in uniqueEvents])
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-MFfiiR/python-ndLKyf
+
+**** chunk mfDist neural data
+#+BEGIN_SRC python :session session :async :tangle yes 
+mfDistActivity = allNeuralData[regressionResults["sigMod"]["mfDistZ"]]
+mfDistChunks = [
+    mfDistActivity[:, t - 6 : t + 6] for t in eventInds if t -6 > 0 and t + 6 < len(mfDistActivity.T)
+]
+mfDistMeans = resampleRows(np.mean(mfDistChunks, axis=0), 20)
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-MFfiiR/python-dLvSv5
+
+**** cluster response types
+#+BEGIN_SRC python :session session :async :tangle yes :eval
+del sys.modules["src.utils.clustering"]
+from src.utils.clustering import groupByLabel
+
+mfDistLabels = cluster_and_plot_functional_data(mfDistMeans, n_clusters=6, featName="mfDist", doPlot=False)
+mfDistResponsesGrouped = groupByLabel(mfDistMeans, labels=mfDistLabels)
+# fig, ax = plt.subplots()
+# ax.imshow(mfDistResponsesGrouped, aspect="auto", vmin=0, vmax=1)
+# ax.set_ylabel("ROI")
+# plt.show()
+
+cluster_and_plot_functional_data(zscore(mfDistMeans,axis=1), n_clusters=5, featName="mfDist")
+#+END_SRC
+
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-MFfiiR/python-rdxkVH
+
+*** find large changes in mfDist 
+** epoch-based clustering
+Do functional clusters differ across behavioral epochs?
+*** get behavioral epochs + tracking index
+#+BEGIN_SRC python :session session :async :tangle yes 
+del sys.modules["src.utils.tracking"]
+from src.utils.tracking import getBehavioralEpochs
+
+# get behavioral epochs
+epochs, changePoints, trialCenters = getBehavioralEpochs(flyvrData) 
+ti = getTrackingIndex(flyvrData)
+nEpochs = len(epochs)
+fig, ax = plt.subplots()
+ax.plot(ti)
+ax.axis("off")
+plt.show()
+
+# convert change points to imaging volume timestamps
+changePointsFictrac = [
+    trialCenters[c] for c in changePoints[:-1]
+]  # exclude last change point, which is just the last sample
+changePointsIm = np.array([np.argmin(abs(fsav - c)) for c in changePointsFictrac] + [len(fsav) - 1])
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-MFfiiR/python-XDheSs
+
+*** plot epochs 
+#+BEGIN_SRC python :session session :async :tangle yes 
+
+vidData, favs, mRS, fps = (
+    flyvrData["vidData"],
+    flyvrData["favs"],
+    flyvrData["speedDict"]["rotational_speed"],
+    flyvrData["fps"],
+)
+
+# get desired time for resampling
+desiredTimeFictrac = np.arange(len(mRS))  # fictrac samples for each video frame
+
+# side-side female movement
+stim = vidData["video"]["stimulus"]["actuator"]
+sideSide = stim[:, 4]
+sideSideResamp = np.interp(desiredTimeFictrac, favs, sideSide)
+
+# chunk the data
+avgDT = 1 / fps
+nCycles = 1
+nSamples = 120
+stimChunks, peaks, trialCenters, trialTime, avgSamples = chunkTrackingData(
+    sideSideResamp, nCycles=nCycles, dt=avgDT, nSamples=nSamples, isBacknforth=True
+)
+
+# Chunk rotational speed
+speedChunks, _, _, _, _ = chunkTrackingData(
+    mRS,
+    nCycles=nCycles,
+    peaks=peaks,
+    dt=avgDT,
+    nSamples=nSamples,
+    isSpeed=True,
+    isBacknforth=True,
+)
+plot_epochs(speedChunks, changePoints)
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-MFfiiR/python-XMqdcQ
+
+*** side-side
+Now that we have change points in the imaging time base, let's split up the neural data by epoch and compare the clusters. 
+**** get back-forth cycles
+#+BEGIN_SRC python :session session :async :tangle yes 
+from scipy.signal import find_peaks, resample
+
+sideSide = regressionData["sideSide"]  # backnforth stim
+cyclePeaksPos, _ = find_peaks(np.where(sideSide > 0, 1, 0))
+cyclePeaksNeg, _ = find_peaks(np.where(sideSide > 0, 0, 1))
+cyclePeaks = np.sort(list(cyclePeaksPos) + list(cyclePeaksNeg))
+periods = [
+    (cyclePeaks[i * 2], cyclePeaks[i * 2 + 2])
+    for i in range(len(cyclePeaks))
+    if i * 2 + 2 < len(cyclePeaks)
+]
+
+epochPeriods = []
+periodStart = 0
+
+for i in range(len(epochs)):
+    epochPeriods.append([p for p in periods if periodStart < p[-1] < changePointsIm[i]])
+    periodStart = changePointsIm[i]
+
+
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-MFfiiR/python-KOdMgY
+**** side-side motion averaged across trials 
+#+BEGIN_SRC python :session session :async :tangle yes 
+resampLength = int(2 * np.mean(np.diff(cyclePeaks)))
+sideSideActivity = allNeuralData[regressionResults["sigMod"]["sideSideZ"]]
+sideSideEpochs = [
+    [resampleRows([x[t0 : t1 + 1] for t0, t1 in period], resampLength) for x in sideSideActivity]
+    for period in epochPeriods
+]
+sideSideEpochMeans = [np.mean(sideSideChunks, axis=1) for sideSideChunks in sideSideEpochs]
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-MFfiiR/python-7txCsZ
+
+**** cluster response types across ROIs
+#+BEGIN_SRC python :session session :async :tangle yes :eval
+# del sys.modules["src.utils.clustering"]
+# from src.utils.clustering import groupByLabel
+
+fig, ax = plt.subplots(1, len(epochs))
+
+for i, sideSideMeans in enumerate(sideSideEpochMeans):
+    # get labels 
+    sideSideLabels = cluster_and_plot_functional_data(sideSideMeans, percentile=90, featName="side-side", doPlot=False)
+
+    # make plot 
+    sideSideResponsesGrouped = groupByLabel(sideSideMeans, labels=sideSideLabels)
+    ax[i].imshow(resampleRows(sideSideResponsesGrouped, 50), aspect="auto", vmin=0, vmax=1)
+    ax[i].axes.get_xaxis().set_visible(False)
+    if i == 0:
+        ax[i].set_ylabel("ROI")
+    else:
+        ax[i].axis("off")
+    ax[i].set_title(f"epoch {i+1}")
+
+plt.show()
+
+cluster_and_plot_functional_data(zscore(np.vstack(sideSideEpochMeans), axis=1), percentile=99.5, featName="side-side")
+
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-MFfiiR/python-JIYrJY
+**** find changes in tuning
+#+BEGIN_SRC python :session session :async :tangle yes 
+# del sys.modules["src.utils.clustering"]
+from src.utils.clustering import (compareTuningSideSide)
+
+# get cross-epoch correlations across all ROIs 
+corrMat, pMat = compareTuning(sideSideEpochMeans)
+i, j = np.triu_indices(nEpochs, k=1)  # comparison types 
+
+# get ROIs with significantly different tuning across epochs 
+whereSigP = np.argwhere(
+    np.logical_and(pMat < 0.05 / np.size(pMat), corrMat < 0)
+)  # sig. coefs must meet p value thresh and must be negative
+sigCorr = corrMat[whereSigP[:, 0], whereSigP[:, 1]]
+sigROIs = np.unique(whereSigP[:, 1])
+print(sigROIs)
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-MFfiiR/python-EpIns2
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-MFfiiR/python-6hbLqz
+
+*** mfDist 
+
+**** get events
+#+BEGIN_SRC python :session session :async :tangle yes 
+deltaThresh = -1
+mfDist = list(regressionData["mfDist"])
+fFV = np.diff([0] + mfDist)
+fFVBinary = np.where(fFV < deltaThresh, 1, 0)  # 1mm / time step
+distEvents, _ = label(fFVBinary)
+uniqueEvents = np.unique(distEvents[distEvents > 0])
+events = np.squeeze([np.argwhere(distEvents == l)[0] for l in uniqueEvents])
+
+# break up events into epochs
+epochEvents = []
+eventStart = 0
+winLen = 6  # time pre- and post-change in mfDist
+
+for i in range(len(epochs)):
+    epochEvents.append(
+        [
+            int(e)
+            for e in events
+            if eventStart < e < changePointsIm[i]
+            and e - winLen > 0
+            and e + winLen < len(mfDist)
+        ]
+    )
+    eventStart = changePointsIm[i]
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-MFfiiR/python-Runi4X
+**** chunk mfDist neural data
+#+BEGIN_SRC python :session session :async :tangle yes 
+mfDistActivity = allNeuralData[regressionResults["sigMod"]["mfDistZ"]]
+mfDistEpochs = [
+    [mfDistActivity[:, t - winLen : t + winLen] for t in epoch] for epoch in epochEvents
+]
+mfDistEpochMeans = []
+
+for i in range(len(epochs)):
+    mfDistEpochMeans.append(
+        # resampleRows(np.mean(mfDistEpochs[i], axis=0), 100)
+        np.mean(mfDistEpochs[i], axis=0)
+    )  # average across trials
+mfDistMeans = np.vstack(mfDistEpochMeans)
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-MFfiiR/python-9oh6bd
+**** cluster response types
+#+BEGIN_SRC python :session session :async :tangle yes :eval
+del sys.modules["src.utils.clustering"]
+from src.utils.clustering import groupByLabel
+
+fig, ax = plt.subplots(1, len(epochs))
+
+for i, mfDistMeans in enumerate(mfDistEpochMeans):
+    # get labels
+    mfDistLabels = cluster_and_plot_functional_data(
+        mfDistMeans, percentile=99, featName="mfDist", doPlot=False
+    )
+
+    # make plot
+    mfDistResponsesGrouped = groupByLabel(mfDistMeans, labels=mfDistLabels)
+    ax[i].imshow(mfDistResponsesGrouped, aspect="auto", vmin=0, vmax=1)
+    if i == 0:
+        ax[i].set_ylabel("ROI")
+    else:
+        ax[i].axis("off")
+    ax[i].set_title(f"epoch {i+1}")
+plt.show()
+#+END_SRC
+
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-MFfiiR/python-cf0t7Q
+**** cross-epoch tuning changes (inter-epoch correlations)
+Suppose we have two epochs, A and B. We want to measure the correlation between an ROI's tuning properties across these two contexts (and repeat for all ROIs).
+
+We can also extend this approach to an arbitrary number of epochs: instead of generating a comparison array with size 2 x nROIs, we'll generate an array of size nComparisons x nROIs.
+***** compute cross-epoch correlations
+
+#+BEGIN_SRC python :session session :async :tangle yes 
+del sys.modules["src.utils.clustering"]
+from src.utils.clustering import (
+    compareTuningMFDist,
+)
+
+# get cross-epoch correlations across all ROIs
+corrMat, pMat, mfDistEpochMeans = compareTuningMFDist(mfDistActivity, epochEvents)
+i, j = np.triu_indices(nEpochs, k=1)  # comparison types
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-MFfiiR/python-I78nrP
+***** statistical analysis
+Find statistically significant comparisons.
+
+Interpreting results:
+Example result within whereSigP might be [1, 4]. This means the 1st comparison and the 4th ROI. Now we need to find the epochs corresponding to the 1st comparison. We find these via the triu_indices: {i[1], j[1]} = {0, 2}, which means the comparison between the 0th and 2nd epoch (or 1st and 3rd, in non-pythonic indices).
+
+#+BEGIN_SRC python :session session :async :tangle yes 
+whereSigP = np.argwhere(
+    np.logical_and(pMat < 0.05 / np.size(pMat), corrMat < 0)
+)  # sig. coefs must meet p value thresh and must be negative
+sigCorr = corrMat[whereSigP[:, 0], whereSigP[:, 1]]
+sigROIs = np.unique(whereSigP[:, 1])
+print(sigROIs)
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-MFfiiR/python-70fgR3
+***** plot example of ROIs that switch tuning properties
+#+BEGIN_SRC python :session session :async :tangle yes 
+nPlot = min(5, len(sigROIs))
+
+fig, ax = plt.subplots(1, nPlot)
+
+# iterate over ROIs that switch tuning property
+for idx, whichROI in enumerate(sigROIs[:nPlot]):
+    j, k = np.triu_indices(nEpochs, k=1)  # comparison types 
+
+    # iterate over unique epoch comparisons 
+    for i in range(len(pMat)):
+        if pMat[i][whichROI] < 0.05 / np.size(pMat) and corrMat[i][whichROI] < 0:
+            matchingEpochs = [j[i], k[i]]  # epochs that match this comparison type 
+
+            for e in matchingEpochs:
+                ax[idx].plot(mfDistEpochMeans[whichROI][e])
+                ax[idx].axis("off")
+
+plt.show()
+
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-MFfiiR/python-HL8Rkf
+**** null distribution analysis
+Next, what if we want to compare the true cross-epoch relationship with a null distribution of correlations? The goal with this exercise is to determine if the epochs we observe are actually meaningful in terms of differences in tuning properties. To do this, we need to first compute fake epoch boundaries (change points) and then compare tuning correlations across these fake epochs.
+***** compute null distribution and true cosine similarities
+#+BEGIN_SRC python :session session :async :tangle yes 
+del sys.modules["src.utils.clustering"]
+from src.utils.clustering import computeTuningMFDist
+
+# get null distribution of cosine similarities 
+mfDistNullSims = computeTuningMFDist(
+    activity=mfDistActivity, events=events, cps=None, nEpochs=2, nFolds=1000
+)
+
+# get true cosine similarites across epochs
+mfDistTrueSims = computeTuningMFDist(
+    activity=mfDistActivity, events=events, cps=changePointsIm, nEpochs=2, nFolds=1
+)
+
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-MFfiiR/python-tnsEr2
+***** compare distribution with true value to find significant differences
+#+BEGIN_SRC python :session session :async :tangle yes 
+nComparisons, nROIs, nFolds = mfDistNullSims.shape
+mfDistSigDiff = []
+for i in range(nComparisons):
+    diff = []
+    for j in range(nROIs):
+        roiDistribution = np.array(mfDistNullSims[i][j])
+        roiDistribution[np.isnan(roiDistribution)] = 0
+        empiricalP = 1 - float((sum(roiDistribution > mfDistTrueSims[i][j]) + 1) / (nFolds + 1))
+        diff.append(empiricalP)
+    mfDistSigDiff.append(diff)
+mfDistSigDiff = np.array(mfDistSigDiff)
+whereSig = np.argwhere(mfDistSigDiff < 0.05/np.size(mfDistSigDiff))
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-MFfiiR/python-atu2J3
+
+* make plots
+** plot strongest side-side encoding ROIs
+#+BEGIN_SRC python :session session :async :tangle yes :eval 
+feat = "sideSideRX"
+sideSideROIs = regressionResults["sigMod"][feat]
+fig, ax = plt.subplots()
+time = np.arange(len(allNeuralData.T)) / 1.4
+offset = 0.5
+nPlot = min(200, len(sideSideROIs))
+for i in range(nPlot):
+    ax.plot(time, allNeuralData[sideSideROIs[i]] + offset*i)
+ax.plot(time, regressionDataSimple[feat] + nPlot*offset + 5, label = "side-side stim")
+ax.set_xlabel("time (s)")
+plt.show()
+
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-xUtn2b/python-kpETBn
+
+** plot strongest mfDist-encoding ROIs
+#+BEGIN_SRC python :session session :async :tangle yes :eval 
+feat = "mfDistZ"
+sideSideROIs = regressionResults["sigMod"][feat]
+fig, ax = plt.subplots()
+time = np.arange(len(allNeuralData.T)) / 1.4
+offset = 0.5
+nPlot = min(100, len(sideSideROIs))
+for i in range(nPlot):
+    ax.plot(time, allNeuralData[sideSideROIs[i]] + offset*i)
+ax.plot(time, regressionDataSimple["mfDistZ"] + nPlot*offset + 5, label = "side-side stim")
+ax.set_xlabel("time (s)")
+plt.show()
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-xUtn2b/python-HHz6vl
+

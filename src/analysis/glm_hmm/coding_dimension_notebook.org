@@ -1,0 +1,826 @@
+* results log
+- mfDistance predicts changes in activity projected along the male rotational speed dimension (survives multiple comparisons correction). interestingly, side-side motion does not. ref: [[id:A7251AD3-DD3D-484F-9863-DB8EABC687FA][male speed flow]]
+  - the weights are negative, indicating that /decreases/ in mfDistance (i.e., the female getting closer) drive changes in activity
+    - given that the female moving closer to the male drives activity in the mRS dimension, looked for time points with large negative changes in mfDist. next, hypothesized that responses along the mRS dim may depend on tracking state at the time of the stimulus event--split responses into low and high baseline tracking activity states. the result is that visual cues drive activity more strongly when tracking activity is high. ref: [[id:C4FEE439-F1C5-4820-88AC-E805E98A9AD5][mfDist activity conditioned on tracking activity state]]
+      - possible interpretation: state unlocks visual drive onto turning neurons?
+- unique dynamics observed in response to mfDist cues along tracking and speed dimensions
+  | [[file:state_dependent_responses_trackingCD.png]] | [[file:state_dependent_responses_mRSCD.png]] |
+  - left is tracking dimension; right is mRS dimension. Transient increase along tracking dimension and ramping response along speed dimension. How might we interpret these differences in dynamics? mRS is more like an attractor that accumulates activity? 
+
+* setup environment
+#+BEGIN_SRC elisp :session session
+(pyenv-mode-set "ssm")
+#+END_SRC
+
+#+RESULTS:
+
+* imports
+#+BEGIN_SRC python :session session :async :tangle yes 
+import sys
+import glob
+sys.path.insert(0, "/Users/mjaragon/Documents/github/courtship_dynamics/")
+from src.utils.fictrac import *
+from src.utils.neural_data import *
+from src.utils.movies import *
+from src.utils.bootstrap import *
+from src.utils.regression import *
+from src.utils.tracking import *
+from src.utils.sliding_windows import *
+from src.utils.regression import *
+from src.utils.data_loading import * 
+from sklearn.decomposition import PCA
+import matplotlib.colors as mcolors
+import matplotlib.cm as cm
+import numpy as np
+from scipy.interpolate import RBFInterpolator
+import seaborn as sns
+import ssm
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Z6nLNW/python-LAwZ4S
+* define global variables (analysis directory)
+#+NAME: expDir
+#+BEGIN_SRC emacs-lisp
+;; "/Users/mjaragon/Desktop/brain_analysis_data/functional/20240620/101"
+;; "/Users/mjaragon/Desktop/brain_analysis_data/functional/20240617/101"
+"/Users/mjaragon/Desktop/brain_analysis_data/functional/20240617/201"
+;; "/Users/mjaragon/Desktop/brain_analysis_data/functional/20240530/201"
+;; "/Users/mjaragon/Desktop/brain_analysis_data/functional/20240625/101"
+;; "/Users/mjaragon/Desktop/brain_analysis_data/functional/20240703/101"  ;; male 
+#+END_SRC
+
+#+RESULTS: expDir
+: /Users/mjaragon/Desktop/brain_analysis_data/functional/20240617/201
+
+* defs
+#+BEGIN_SRC python :session session :async :tangle yes 
+import numpy as np
+from scipy.interpolate import RBFInterpolator
+
+
+def GenerateFlowField(
+    data: np.ndarray,
+    dt: float = 1.0,
+    gridSize: int = 50,
+    kernel: str = "thin_plate_spline",
+    coverage: float = 0.95,
+):
+    """
+    Generate a flow field from time-series data by computing velocities
+    and using radial basis function interpolation to estimate a continuous
+    vector field. Only the top two features of `data` are used for (x, y)
+    coordinates.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        A 2D numpy array of shape (T, F), where T is the number of time steps
+        and F is the number of features. The top two features are interpreted
+        as x, y coordinates. So data[t, 0] is x(t), data[t, 1] is y(t).
+    dt : float, optional
+        The time delta between successive rows of data, by default 1.0.
+    gridSize : int, optional
+        The number of points in each dimension of the interpolation grid
+        used for plotting the flow field, by default 50.
+    kernel : str, optional
+        The kernel to use in RBFInterpolator, by default 'thin_plate_spline'.
+    coverage : float, optional
+        Fraction of data coverage for x and y coordinates. The flow field
+        is cropped to this quantile-based bounding box. For example, 0.95
+        means the grid will cover the central 95% region of the data in both
+        x and y. By default 0.95.
+
+    Returns
+    -------
+    Xg : np.ndarray
+        2D array of shape (gridSize, gridSize) giving the x-coordinates
+        of the interpolation grid.
+    Yg : np.ndarray
+        2D array of shape (gridSize, gridSize) giving the y-coordinates
+        of the interpolation grid.
+    Vx : np.ndarray
+        2D array of shape (gridSize, gridSize) of the x-component of
+        the flow field on the grid.
+    Vy : np.ndarray
+        2D array of shape (gridSize, gridSize) of the y-component of
+        the flow field on the grid.
+
+    Raises
+    ------
+    ValueError
+        If data has fewer than 2 features, or fewer than 2 rows for computing velocity.
+
+    Notes
+    -----
+    - This function computes velocity vectors by finite differences:
+        v_x(t) = (x(t+1) - x(t)) / dt
+        v_y(t) = (y(t+1) - y(t)) / dt
+      which are associated with the position at time t.
+    - The RBFInterpolator is then used to fit a continuous function to the
+      observed velocity vectors, which can be evaluated on a grid.
+    - The 'coverage' parameter crops the grid to the [alpha, 1-alpha] quantiles
+      of the data, where alpha = (1 - coverage) / 2.
+    """
+
+    # Check that we have enough features to extract x,y
+    if data.shape[1] < 2:
+        raise ValueError(
+            "Input data must have at least 2 features for x,y coordinates."
+        )
+
+    # Check that we have enough time steps to compute velocity
+    if data.shape[0] < 2:
+        raise ValueError("Input data must have at least 2 rows (time steps).")
+
+    # Extract the top two features as x, y
+    x_vals = data[:, 0]
+    y_vals = data[:, 1]
+
+    # Positions at time t (for t = 0..T-2)
+    positions = np.column_stack([x_vals[:-1], y_vals[:-1]])
+
+    # Compute velocities between successive time steps
+    vx = (x_vals[1:] - x_vals[:-1]) / dt
+    vy = (y_vals[1:] - y_vals[:-1]) / dt
+
+    # Use RBF interpolation for a smooth velocity field
+    rbf_vx = RBFInterpolator(positions, vx, kernel=kernel)
+    rbf_vy = RBFInterpolator(positions, vy, kernel=kernel)
+
+    # -- Compute quantile-based cropping --
+    if coverage < 0 or coverage > 1:
+        raise ValueError("coverage must be between 0 and 1.")
+
+    alpha = (1 - coverage) / 2
+    x_min = np.quantile(x_vals, alpha)
+    x_max = np.quantile(x_vals, 1 - alpha)
+    y_min = np.quantile(y_vals, alpha)
+    y_max = np.quantile(y_vals, 1 - alpha)
+
+    # Build the grid over the desired region
+    Xg = np.linspace(x_min, x_max, gridSize)
+    Yg = np.linspace(y_min, y_max, gridSize)
+    Xg2D, Yg2D = np.meshgrid(Xg, Yg)
+
+    # Evaluate the interpolant on the grid
+    grid_points = np.column_stack([Xg2D.ravel(), Yg2D.ravel()])
+    Vx_vals = rbf_vx(grid_points).reshape(Xg2D.shape)
+    Vy_vals = rbf_vy(grid_points).reshape(Xg2D.shape)
+
+    return Xg2D, Yg2D, Vx_vals, Vy_vals
+
+
+def plot_most_likely_dynamics(
+    model,
+    mask,
+    xlim=(-4, 4),
+    ylim=(-3, 3),
+    nxpts=40,
+    nypts=40,
+    alpha=0.8,
+    ax=None,
+    figsize=(3, 3),
+):
+    color_names = ["windows blue", "red", "amber", "faded green"]
+    colors = sns.xkcd_palette(color_names)
+    K = model.K
+    # assert sum(mask) == 2, "mask must specify exactly two dimensions"
+    x = np.linspace(*xlim, nxpts)
+    y = np.linspace(*ylim, nypts)
+    X, Y = np.meshgrid(x, y)
+    xy = np.column_stack((X.ravel(), Y.ravel()))
+
+    # Get the probability of each state at each xy location
+    z = np.argmax(xy.dot(model.transitions.Rs.T[mask]) + model.transitions.r, axis=1)
+
+    if ax is None:
+        fig = plt.figure(figsize=figsize)
+        ax = fig.add_subplot(111)
+
+    for k, (A, b) in enumerate(zip(model.dynamics.As, model.dynamics.bs)):
+        dxydt_m = xy.dot(A.T[mask][:, mask]) + b[mask] - xy
+
+        zk = z == k
+        if zk.sum(0) > 0:
+            ax.quiver(
+                xy[zk, 0],
+                xy[zk, 1],
+                dxydt_m[zk, 0],
+                dxydt_m[zk, 1],
+                color=colors[k % len(colors)],
+                alpha=alpha,
+            )
+
+    ax.set_xlabel("$x_1$")
+    ax.set_ylabel("$x_2$")
+
+    plt.tight_layout()
+    plt.show()
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.interpolate import griddata
+
+
+def plot_flow_field(
+    latent_dynamics,
+    xlim=(-4, 4),
+    ylim=(-3, 3),
+    nxpts=20,
+    nypts=20,
+    alpha=0.8,
+    ax=None,
+    figsize=(6, 6),
+):
+    """
+    Plot flow fields for 2D latent dynamics.
+
+    Parameters:
+        latent_dynamics (numpy.ndarray): Array of shape (time x 2) representing latent dynamics.
+        xlim (tuple): x-axis limits as (min, max).
+        ylim (tuple): y-axis limits as (min, max).
+        nxpts (int): Number of grid points along the x-axis.
+        nypts (int): Number of grid points along the y-axis.
+        alpha (float): Transparency of the arrows.
+        ax (matplotlib.axes.Axes): Axes object to plot on. If None, creates a new figure and axes.
+        figsize (tuple): Size of the figure (if `ax` is None).
+    """
+    # Clean latent dynamics data
+    valid_mask = np.isfinite(latent_dynamics).all(axis=1)
+    latent_dynamics = latent_dynamics[valid_mask]
+
+    # Create grid points
+    x = np.linspace(*xlim, nxpts)
+    y = np.linspace(*ylim, nypts)
+    X, Y = np.meshgrid(x, y)
+
+    # Ensure gradients are aligned with latent dynamics
+    dxdt = np.gradient(latent_dynamics[:, 0])
+    dydt = np.gradient(latent_dynamics[:, 1])
+
+    points = latent_dynamics
+    dxy = np.column_stack((dxdt, dydt))
+
+    # Interpolate dynamics to match the grid
+    U = griddata(points, dxy[:, 0], (X, Y), method="linear", fill_value=0)
+    V = griddata(points, dxy[:, 1], (X, Y), method="linear", fill_value=0)
+
+    if ax is None:
+        fig = plt.figure(figsize=figsize)
+        ax = fig.add_subplot(111)
+
+    # Plot flow field
+    ax.quiver(X, Y, U, V, color="blue", alpha=alpha)
+
+    ax.set_xlim(xlim)
+    ax.set_ylim(ylim)
+    ax.set_xlabel("$x_1$")
+    ax.set_ylabel("$x_2$")
+    ax.set_title("Flow Field of Latent Dynamics")
+
+    plt.tight_layout()
+    plt.show()
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Z6nLNW/python-8fQfK6
+
+* load data 
+#+BEGIN_SRC python :session session :async :tangle yes :var expDir=expDir
+allNeuralData, idxToROI, roiToIdx = loadSupervoxelData(expDir)
+flyvrData = loadFlyVRData(expDir)
+cnnData = loadCNNPredictions(expDir)
+fsav = getFictracSampsAtVolume(flyvrData)  # fictrac samples for each imaging volume
+
+# Prepare regression data
+regressionData = makeRegressionData(
+    flyvrData=flyvrData,
+    cnnData=cnnData,
+    fictracTimestamps=fsav,
+)
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Z6nLNW/python-hcyPAE
+
+* ssm analysis
+** PCA on tracking-encoding ROIs
+#+BEGIN_SRC python :session session :async :tangle yes 
+feat = "trackingIndexZ"
+pca = PCA(n_components=100)
+YPCA = pca.fit_transform(
+    allNeuralData.T
+).T  # fit on nSamples x nFeatures -> nFeatures x nSamples
+#+END_SRC
+
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Z6nLNW/python-BRxdQ7
+
+** fit SLDS with grid search
+#+BEGIN_SRC python :session session :async :tangle yes 
+del sys.modules["src.utils.ssm"]
+from src.utils.ssm import SSMCV
+
+# data
+data = YPCA
+inputs = np.vstack(
+    (
+        regressionData["sideSideZ"],
+        regressionData["mfDistZ"],
+        regressionData["mRSZ"],
+        regressionData["mFSZ"],
+    )
+).T
+T = len(data.T)
+if len(inputs) > T:
+    inputs = inputs[:T]
+elif len(inputs) < T:
+    resid = T - len(inputs)
+    inputs = np.pad(inputs, ((0, resid), (0, 0)), mode="edge")
+
+
+# model
+Ds = (1, 2)
+Ls = (4, 8, 16, 32)
+ssmModels = SSMCV(data=data.T, inputs=inputs)
+elbos = ssmModels.doGridSearch(Ds=Ds, Ls=Ls, nFolds=3)
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-StucAr/python-TsxLsm
+
+*** plot grid search elbo results
+#+BEGIN_SRC python :session session :async :tangle yes 
+fig, ax = plt.subplots()
+ax.imshow(elbos)
+plt.show()
+#+END_SRC
+
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-StucAr/python-Jlg7LA
+
+** fit the SLDS model
+#+BEGIN_SRC python :session session :async :tangle yes 
+print("Fitting SLDS with Laplace-EM")
+data = YPCA
+inputs = np.vstack(
+    (
+        regressionData["sideSideZ"],
+        regressionData["mfDistZ"],
+        regressionData["mRSZ"],
+        regressionData["mFSZ"],
+    )
+).T
+T = len(data.T)
+if len(inputs) > T:
+    inputs = inputs[:T]
+elif len(inputs) < T:
+    resid = T - len(inputs)
+    inputs = np.pad(inputs, ((0, resid), (0, 0)), mode = "edge")
+
+# Create the model and initialize its parameters
+slds = ssm.SLDS(
+    len(data),
+    1,
+    16,
+    M = len(inputs.T),
+    emissions="gaussian_orthog",
+    transitions="recurrent_only",
+    dynamics="gaussian",
+    single_subspace=True,
+)
+
+# Fit the model using Laplace-EM with a structured variational posterior
+q_elbos_lem, q_lem = slds.fit(
+    data.T,
+    method="laplace_em",
+    variational_posterior="structured_meanfield",
+    initialize=False,
+    inputs=inputs,
+    num_iters=20,
+)
+
+# Get the posterior mean of the continuous states
+q_lem_x = q_lem.mean_continuous_states[0]
+q_lem_d = q_lem.mean_discrete_states[0]
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Z6nLNW/python-s1LltX
+
+** analyze timescales
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-StucAr/python-NO5RNb
+
+#+BEGIN_SRC python :session session :async :tangle yes 
+As = slds.dynamics.As
+timescales = []
+for A in As:
+    eigenvalues, eigenvectors = np.linalg.eig(A)
+    timescales.append([abs(np.log(abs(e)))**-1 for e in eigenvalues])
+timescales = np.array(timescales)
+print(np.max(timescales))
+
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Z6nLNW/python-uPCggr
+
+** plot continuous latent states
+#+BEGIN_SRC python :session session :async :tangle yes :eval 
+fig, ax = plt.subplots()
+# for i in range(6):
+#     ax.plot(q_lem_x[:, i])
+# plt.show()
+ax.plot(q_lem_x[:, np.argmax(timescales)]); plt.show()
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Z6nLNW/python-fkZYcR
+** plot ssm discrete states
+#+BEGIN_SRC python :session session :async :tangle yes :eval
+q_lem_d = q_lem.mean_discrete_states[0]
+plt.plot(q_lem_d); plt.show()
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-StucAr/python-evZzse
+
+** plot ssm most likely dynamics
+#+BEGIN_SRC python :session session :async :tangle yes :eval 
+trueInds = [0, np.argmax(timescales)]
+mask = [False for i in range(len(timescales)) if i not in trueInds else True ]
+plot_most_likely_dynamics(slds, mask)
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Z6nLNW/python-wwD8w4
+
+** plot input dynamics matrix 
+#+BEGIN_SRC python :session session :async :tangle yes 
+fig, ax = plt.subplots(1, 2)
+vmin, vmax = np.min(slds.dynamics.Vs), np.max(slds.dynamics.Vs)
+ax[0].imshow(slds.dynamics.Vs[0], cmap='bwr', vmin=vmin, vmax=vmax)
+# ax[1].imshow(slds.dynamics.Vs[1], cmap='bwr', vmin=vmin, vmax=vmax)
+plt.show()
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-StucAr/python-kljM09
+
+** plot flow field for latent states
+
+| expName      | hyperparameters | model              | results                                          |
+|--------------+-----------------+--------------------+--------------------------------------------------|
+| 20240620_101 | D=1, C=4        | lds (input-driven) | 1, 0, 1, 0: line attractor                       |
+|--------------+-----------------+--------------------+--------------------------------------------------|
+|              |                 |                    | 1, 0, 0, 1: point attractor, rotational dynamics |
+|              |                 |                    | 1, 1, 0, 0: point attractor                      |
+| 20240617_101 | D=1, C=4        | lds (input-driven) | 1, 0, 1, 0: line attractor                       |
+|--------------+-----------------+--------------------+--------------------------------------------------|
+| 20240530_201 | D=1, C=4        | lds (input-driven) | 0, 1, 1, 0: line attractor                       |
+|--------------+-----------------+--------------------+--------------------------------------------------|
+| 20240625_101 | D=1, C=4        | lds (input-driven) | 1, 0, 1, 0: line attractor (strong)              |
+|              |                 |                    |                                                  |
+#+BEGIN_SRC python :session session :async :tangle yes :eval
+from ssm.plots import plot_dynamics_2d
+color_names = ["windows blue",
+               "red",
+               "amber",
+               "faded green",
+               "dusty purple",
+               "orange",
+               "clay",
+               "pink",
+               "greyish",
+               "mint",
+               "light cyan",
+               "steel blue",
+               "forest green",
+               "pastel purple",
+               "salmon",
+               "dark brown"]
+colors = sns.xkcd_palette(color_names)
+# whichPlot = [True, False, True, False]
+# whichPlot = [True, False, False, True]  
+# whichPlot = [True, True, False, False]
+# whichPlot = [False, True, True, False]
+# whichPlot = [False, True, False, True]
+# whichPlot = [False, False, False, False, True, True]
+A_est = slds.dynamics.A[whichPlot][:, whichPlot]
+b_est = slds.dynamics.b[whichPlot]
+
+fig, ax = plt.subplots()
+plot_dynamics_2d(A_est, b_est, npts=25, axis=ax, color=colors[1])
+ax.set_xlabel("$x_1$")
+ax.set_ylabel("$x_2$")
+ax.set_title("Inferred Dynamics")
+plt.show()
+
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-StucAr/python-dt6cVd
+** sample from model
+#+BEGIN_SRC python :session session :async :tangle yes 
+_, _, y = slds.sample(T, input=inputs)
+plt.plot(data.T[:, 2])
+plt.plot(y[:, 2])
+plt.show()
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-StucAr/python-xN6Ydg
+
+* run regression
+#+BEGIN_SRC python :session session :async :tangle yes 
+regressionDataSimple = {
+    k: v
+    for k, v in regressionData.items()
+    if k in ["mfDistZ", "sideSideZ", "mRSZ", "mFSZ", "trackingIndexZ"]
+}
+regressionResults = runRegression(regressionDataSimple, allNeuralData, cutoff=0.001)
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-StucAr/python-VNVtCV
+
+* coding dimension analysis 
+** project activity onto coding dimensions
+#+BEGIN_SRC python :session session :async :tangle yes 
+mfDistCD = np.array(regressionResults["modelParams"]["mfDistZ"])
+sideSideCD = np.array(regressionResults["modelParams"]["sideSideZ"])
+trackingCD = np.array(regressionResults["modelParams"]["trackingIndexZ"])
+mFSCD = np.array(regressionResults["modelParams"]["mFSZ"])
+mRSCD = np.array(regressionResults["modelParams"]["mRSZ"])
+mfDistProj = zscore(allNeuralData.T @ mfDistCD)
+sideSideProj = zscore(allNeuralData.T @ sideSideCD)
+trackingProj = zscore(allNeuralData.T @ trackingCD)
+mFSProj = zscore(allNeuralData.T @ mFSCD)
+mRSProj = zscore(allNeuralData.T @ mRSCD)
+
+# fig, ax = plt.subplots(1, 3)
+# ax[0].scatter(mfDistProj, sideSideProj)
+# plt.show()
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-StucAr/python-SxQq5P
+
+** plot low-d dynamics
+#+BEGIN_SRC python :session session :async :tangle yes :eval no
+time = np.arange(len(allNeuralData.T))
+fig, ax = plt.subplots()
+
+# ax.scatter(mFSProj, trackingProj, c = time, alpha = 0.7)
+# ax.scatter(sideSideProj, mfDistProj, c = time)
+# ax.scatter(mfDistProj, trackingProj, c=time)
+# ax.scatter(sideSideProj, trackingProj, c=time)
+ax.scatter(mfDistProj, sideSideProj, c = time)
+ax.set_xlabel("speed dimension")
+ax.set_ylabel("tracking dimension")
+plt.show()
+
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-nGRYbK/python-3Epq57
+
+** flow field
+#+BEGIN_SRC python :session session :async :tangle yes :eval 
+
+# time
+time = np.arange(len(allNeuralData.T))
+
+# Generate flow field
+stackVis = np.vstack((mfDistProj, sideSideProj)).T
+stackMfDistTrack = np.vstack((mfDistProj, trackingProj)).T
+stackSideSideTrack = np.vstack((sideSideProj, trackingProj)).T
+mFSSideSide = np.vstack((mFSProj, sideSideProj)).T
+mFSmfDist = np.vstack((mFSProj, mfDistProj)).T
+mFSTracking = np.vstack((mFSProj, trackingProj)).T
+# stacks = [stackVis, stackMfDistTrack, stackSideSideTrack, mFSSideSide, mFSmfDist, mFSTracking]
+stacks = [mFSTracking]
+# Titles = ["mfDist-sideSide", "mfDist-tracking", "sideSide-tracking", "speed-sideSide", "speed-dist", "speed-tracking"]
+titles = ["speed-tracking"]
+
+for i, stack in enumerate(stacks):
+    fig, ax = plt.subplots(1, 2, figsize = (12, 6))
+    Xg, Yg, Vx, Vy = GenerateFlowField(stack, gridSize = 50)
+
+    # Plot the flow field
+    ax[0].streamplot(Xg, Yg, Vx, Vy, color='blue', density=1)
+    ax[1].scatter(stack[:, 0], stack[:, 1], c=time)
+    ax[1].set_xlim(np.min(Xg), np.max(Xg))
+    ax[1].set_ylim(np.min(Yg), np.max(Yg))
+    ax[0].set_xlabel("X")
+    ax[0].set_ylabel("Y")
+    ax[1].set_xlabel("X")
+    ax[1].set_ylabel("Y")
+    plt.suptitle(titles[i])
+
+    plt.show()
+
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-StucAr/python-0tQrgd
+
+** regress visual cues onto flow velocities
+*** tracking flow 
+#+BEGIN_SRC python :session session :async :tangle yes 
+import statsmodels.api as sm
+trackingVt = np.diff(np.pad(trackingProj, (1, 0), mode = "constant", constant_values = 0))
+bias = np.ones(len(trackingVt))
+minLen = min(len(bias), len(regressionData["mfDistZ"]))
+X = np.vstack((bias[:minLen], regressionData["mfDistZ"][:minLen])).T
+model = sm.OLS(trackingVt[:minLen], X).fit()
+print(model.pvalues[1:], model.params[1:])
+
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-StucAr/python-CBXzrk
+
+*** male speed flow
+:PROPERTIES:
+:ID:       A7251AD3-DD3D-484F-9863-DB8EABC687FA
+:END:
+#+BEGIN_SRC python :session session :async :tangle yes 
+import statsmodels.api as sm
+mRSVT = np.diff(np.pad(mRSProj, (1, 0), mode = "constant", constant_values = 0))
+mFSVT = np.diff(np.pad(mFSProj, (1, 0), mode = "constant", constant_values = 0))
+bias = np.ones(len(mRSVT))
+minLen = min(len(bias), len(regressionData["mfDistZ"]))
+X = np.vstack((bias[:minLen], regressionData["mfDistZ"][:minLen])).T
+model = sm.OLS(mRSVT[:minLen], X).fit()
+print(model.pvalues[1:], model.params[1:])
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-StucAr/python-P1qI9I
+
+*** plot flow displacement as function of activity
+
+**** mRS
+#+BEGIN_SRC python :session session :async :tangle yes 
+fig, ax = plt.subplots()
+time = np.arange(len(mRSProj))
+ax.scatter(mRSProj, mRSVT, c=time)
+ax.set_xlabel("mRS activity")
+ax.set_ylabel("mRS vt")
+plt.show()
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-StucAr/python-n8H9gc
+
+**** tracking
+#+BEGIN_SRC python :session session :async :tangle yes 
+trackingVT = np.diff(np.pad(trackingProj, (1, 0), mode = "constant", constant_values = 0))
+fig, ax = plt.subplots()
+time = np.arange(len(trackingProj))
+ax.scatter(trackingProj, trackingVT, c=time)
+ax.set_xlabel("tracking activity")
+ax.set_ylabel("tracking vt")
+plt.show()
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-StucAr/python-Hsz0Xf
+
+*** mfDist events (moving closer)
+#+BEGIN_SRC python :session session :async :tangle yes 
+
+# get events
+mfDist = list(regressionData["mfDist"])
+fFV = np.diff([0] + mfDist)
+fFVBinary = np.where(fFV < -1 , 1, 0)  # 1mm / time step
+distEvents, _ = label(fFVBinary)
+uniqueEvents = np.unique(distEvents[distEvents > 0])
+eventInds = np.squeeze([np.argwhere(distEvents == l)[0] for l in uniqueEvents])
+# print(eventInds)
+# plt.plot(distEvents); plt.show()
+# plt.plot(mfDist)
+# plt.plot(fFVBinary)
+# plt.show()
+
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Z6nLNW/python-g3p3OX
+
+*** mfDist activity conditioned on tracking activity state
+:PROPERTIES:
+:ID:       C4FEE439-F1C5-4820-88AC-E805E98A9AD5
+:END:
+#+BEGIN_SRC python :session session :async :tangle yes :file "state_dependent_responses_mRSCD.png" :results output file 
+
+# get tracking state at the time of each event
+trackingState = np.array([trackingProj[t] for t in eventInds])
+trackingLow, trackingHigh = np.percentile(trackingState, 30), np.percentile(trackingState, 70)
+
+# align activity to each mfDist event
+tPre, tPost = 10, 30
+alignedActivity = np.array(
+    [
+        mRSProj[t - tPre : t + tPost]
+        for t in eventInds
+        if t - tPre > 0 and t + tPost < len(trackingProj)
+    ]
+)
+validMask = np.array(
+    [t - tPre > 0 and t + tPost < len(trackingProj) for t in eventInds]
+)
+
+# get state-conditioned responses
+fig, ax = plt.subplots(1, 2)
+responsesLow = alignedActivity[trackingState[validMask] <= trackingLow]
+responsesHigh = alignedActivity[trackingState[validMask] >= trackingHigh]
+
+# get bootstrapped responses
+muLow, ubLow, lbLow = computeBootstrappedCIs(abs(responsesLow))
+muHigh, ubHigh, lbHigh = computeBootstrappedCIs(abs(responsesHigh))
+# muLow, ubLow, lbLow = computeBootstrappedCIs(responsesLow)
+# muHigh, ubHigh, lbHigh = computeBootstrappedCIs(responsesHigh)
+
+# make plots 
+time = np.arange(len(alignedActivity.T)) - 10
+fig, ax = plt.subplots(1, 2, sharey=True)
+ax[0].fill_between(time, lbLow, ubLow)
+ax[0].plot(time, muLow, c = 'k', linewidth = 2,)
+ax[1].fill_between(time, lbHigh, ubHigh)
+ax[1].plot(time, muHigh, c = 'k', linewidth = 2)
+sns.despine(ax=ax[0])
+sns.despine(ax=ax[1])
+ax[0].set_xlabel("imaging volume")
+ax[0].set_ylabel("response amplitude (a.u.)")
+plt.savefig("state_dependent_responses_mRSCD.png", dpi=300)
+plt.close()
+#+END_SRC
+
+#+RESULTS:
+[[file:state_dependent_responses_mRSCD.png]]
+
+*** tracking activity conditioned on tracking activity state
+:PROPERTIES:
+:END:
+#+BEGIN_SRC python :session session :async :tangle yes :file "state_dependent_responses_trackingCD.png" :results output file 
+# find latent state with longest timescale
+integrationDim = q_lem_x[:, np.argmax(timescales)]
+
+# get tracking state at the time of each event
+integrationState = np.array([integrationDim[t] for t in eventInds])
+integrationLow, integrationHigh = np.percentile(integrationState, 30), np.percentile(
+    integrationState, 70
+)
+
+# align activity to each mfDist event
+tPre, tPost = 10, 30
+alignedActivity = np.array(
+    [
+        integrationDim[t - tPre : t + tPost]
+        for t in eventInds
+        if t - tPre > 0 and t + tPost < len(integrationDim)
+    ]
+)
+validMask = np.array(
+    [t - tPre > 0 and t + tPost < len(integrationDim) for t in eventInds]
+)
+
+# get state-conditioned responses
+fig, ax = plt.subplots(1, 2)
+responsesLow = alignedActivity[integrationState[validMask] <= integrationLow]
+responsesHigh = alignedActivity[integrationState[validMask] >= integrationHigh]
+
+# get bootstrapped responses
+muLow, ubLow, lbLow = computeBootstrappedCIs(abs(responsesLow))
+muHigh, ubHigh, lbHigh = computeBootstrappedCIs(abs(responsesHigh))
+
+# make plots
+time = np.arange(len(alignedActivity.T)) - 10
+fig, ax = plt.subplots(1, 2, sharey=True)
+ax[0].fill_between(time, lbLow, ubLow)
+ax[0].plot(
+    time,
+    muLow,
+    c="k",
+    linewidth=2,
+)
+ax[1].fill_between(time, lbHigh, ubHigh)
+ax[1].plot(time, muHigh, c="k", linewidth=2)
+sns.despine(ax=ax[0])
+sns.despine(ax=ax[1])
+ax[0].set_xlabel("imaging volume")
+ax[0].set_ylabel("response amplitude (a.u.)")
+plt.savefig("state_dependent_responses_trackingCD.png", dpi=300)
+plt.close()
+#+END_SRC
+
+#+RESULTS:
+[[file:state_dependent_responses_trackingCD.png]]
+

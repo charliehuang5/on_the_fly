@@ -1,0 +1,176 @@
+* setup environment
+#+BEGIN_SRC elisp :session session
+(pyenv-mode-set "ssm")
+#+END_SRC
+
+#+RESULTS:
+
+* imports
+#+BEGIN_SRC python :session session :async :tangle yes 
+import sys
+import glob
+sys.path.insert(0, "/Users/mjaragon/Documents/github/courtship_dynamics/")
+import ssm
+from src.utils.fictrac import *
+from src.utils.neural_data import *
+from src.utils.movies import *
+from src.utils.bootstrap import *
+from src.utils.regression import *
+from src.utils.tracking import *
+from src.utils.sliding_windows import *
+from src.utils.regression import *
+from src.utils.data_loading import * 
+from sklearn.decomposition import PCA
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-aK4SEK/python-x59xTF
+
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-Cs6Eeg/python-Ty7JJd
+
+* define global variables (analysis directory)
+#+NAME: expDir
+#+BEGIN_SRC emacs-lisp
+"/Users/mjaragon/Desktop/brain_analysis_data/functional/20240620/201"
+#+END_SRC
+
+#+RESULTS: expDir
+: /Users/mjaragon/Desktop/brain_analysis_data/functional/20240620/201
+
+* load data 
+
+** load regression data
+#+BEGIN_SRC python :session session :async :tangle yes :var expDir=expDir
+allNeuralData, idxToROI, roiToIdx = loadSupervoxelData(expDir)
+flyvrData = loadFlyVRData(expDir)
+cnnData = loadCNNPredictions(expDir)
+fsav = getFictracSampsAtVolume(flyvrData)  # fictrac samples for each imaging volume
+
+# prepare regression data
+regressionData = makeRegressionData(
+    flyvrData=flyvrData,
+    cnnData=cnnData,
+    fictracTimestamps=fsav,
+    nImagingVolumes=len(allNeuralData.T),
+)
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-aK4SEK/python-ylh6HL
+
+** run PCA on neural data
+#+BEGIN_SRC python :session session :async :tangle yes 
+pca = PCA(n_components=12)
+activityPCA = pca.fit_transform(allNeuralData.T)  # nSamples x nFeatures
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-aK4SEK/python-1Q3bI0
+
+* GLM-HMM
+** fit GLM-HMM
+#+BEGIN_SRC python :session session :async :tangle yes 
+
+# model hyperparameters
+numStates = 2
+obsDim = 1
+inputDim = len(activityPCA.T) + 1
+
+# get tracking index (output of GLM-HMM)
+ti = regressionData["trackingIndex"][:, None]
+
+# get mRS
+mRS = zscore(abs(regressionData["mRS"]))[:, None]
+
+# discretize tracking index
+feat = ti
+nCats = 3
+bins = np.linspace(np.percentile(feat, 20), np.percentile(feat, 80), nCats - 1)
+featDigital = np.digitize(feat, bins)
+inpts = np.vstack((activityPCA.T, np.ones(len(activityPCA))[None, :])).T  # include bias term 
+# plt.plot(tiDigital); plt.show()
+# import pdb; pdb.set_trace() 
+
+# init model 
+glmHMM = ssm.HMM(numStates, obsDim, inputDim, observations="input_driven_obs", transitions="inputdriven", observation_kwargs=dict(C=nCats))
+# glmHMM = ssm.HMM(numStates, obsDim, inputDim, observations="gaussian", transitions="inputdriven")
+
+# fit model 
+nIters = 1000 
+fitLL = glmHMM.fit(featDigital, inputs=inpts, method="em", num_iters=nIters, tolerance=10**-4)
+# fitLL = glmHMM.fit(feat, inputs=inpts, method="em", num_iters=nIters, tolerance=10**-4)
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-aK4SEK/python-NcezhE
+
+** plot recovered parameters
+#+BEGIN_SRC python :session session :async :tangle yes
+fig = plt.figure(figsize=(4, 3), dpi=80, facecolor='w', edgecolor='k')
+recoveredWeights = glmHMM.observations.params
+for k in range(numStates):
+    if k == 0:
+        plt.plot(range(inputDim - 1), recoveredWeights[k][0][:-1],
+                     lw=1.5,  label = "recovered", linestyle = '--')
+    else:
+        plt.plot(range(inputDim - 1), recoveredWeights[k][0][:-1], 
+                     lw=1.5, linestyle = '--')
+plt.yticks(fontsize=10)
+plt.ylabel("GLM weight", fontsize=15)
+plt.xlabel("covariate", fontsize=15)
+plt.axhline(y=0, color="k", alpha=0.5, ls="--")
+plt.legend()
+plt.title("Weight recovery", fontsize=15)
+plt.show()
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-aK4SEK/python-JT4V3Z
+
+** get expected states
+#+BEGIN_SRC python :session session :async :tangle yes 
+# Get expected states:
+posteriorProbs = glmHMM.expected_states(data=featDigital, input=inpts)[0]
+
+fig = plt.figure()
+for k in range(numStates):
+    plt.plot(posteriorProbs[:, k], label="State " + str(k + 1))
+plt.show()
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-aK4SEK/python-9pjm3L
+
+** plot recovered transition matrix
+#+BEGIN_SRC python :session session :async :tangle yes 
+plt.subplot()
+recoveredTransMat = np.exp(glmHMM.transitions.log_Ps)
+plt.imshow(recoveredTransMat, vmin=-1, vmax=1, cmap='bone')
+for i in range(recoveredTransMat.shape[0]):
+    for j in range(recoveredTransMat.shape[1]):
+        text = plt.text(j, i, str(np.around(recoveredTransMat[i, j], decimals=2)), ha="center", va="center",
+                        color="k", fontsize=12)
+plt.xlim(-0.5, numStates - 0.5)
+# plt.xticks(range(0, num_states), ('1', '2', '3'), fontsize=10)
+# plt.yticks(range(0, num_states), ('1', '2', '3'), fontsize=10)
+# plt.ylim(num_states - 0.5, -0.5)
+plt.title("recovered", fontsize = 15)
+plt.show()
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-aK4SEK/python-x8oojR
+
+** plot feat and states
+#+BEGIN_SRC python :session session :async :tangle yes 
+fig, ax = plt.subplots()
+ax.plot(posteriorProbs)
+ax.plot(feat)
+plt.show()
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-aK4SEK/python-AQMRFC

@@ -1,0 +1,430 @@
+#+STARTUP: fold
+Use dynamax to build GLM-HMM models. 
+
+* setup environment
+#+BEGIN_SRC elisp :session session_dynamax
+(pyenv-mode-set "dynamax")
+#+END_SRC
+
+#+RESULTS:
+
+* imports
+#+BEGIN_SRC python :session session_dynamax :async :tangle yes 
+import sys
+import glob
+sys.path.insert(0, "/Users/mjaragon/Documents/github/courtship_dynamics/")
+from src.utils.fictrac import *
+from src.utils.neural_data import *
+from src.utils.movies import *
+from src.utils.bootstrap import *
+from src.utils.regression import *
+from src.utils.tracking import *
+from src.utils.sliding_windows import *
+from src.utils.regression import *
+from src.utils.data_loading import * 
+from src.utils.clustering import * 
+from sklearn.decomposition import PCA
+import matplotlib.colors as mcolors
+import matplotlib.cm as cm
+import numpy as np
+from scipy.interpolate import RBFInterpolator
+import seaborn as sns
+from oasis.functions import deconvolve
+from pathlib import Path
+import statsmodels.api as sm
+from sklearn.metrics import r2_score
+
+from functools import partial
+import jax.numpy as jnp
+import jax.random as jr
+import matplotlib.pyplot as plt
+from jax import vmap
+from jax.nn import one_hot
+from dynamax.hidden_markov_model import (
+    CategoricalHMM,
+    LogisticRegressionHMM,
+    LinearRegressionHMM,
+)
+from dynamax.utils.plotting import CMAP, COLORS, white_to_color_cmap
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-I1qiIy/python-QeSFU9
+
+* defs
+#+BEGIN_SRC python :session session_dynamax :async :tangle yes 
+def splitTrainVal(data, seed=0, trainFrac=0.8):
+    np.random.seed(seed)
+    _, T, _ = data.shape
+    trainLen = int(trainFrac * T)
+    startIdx = np.random.randint(T)
+    stopIdx = (startIdx + trainLen) % T  # wrap
+
+    if startIdx < stopIdx:
+        trainIndices = np.arange(startIdx, stopIdx)
+    else:
+        trainIndices = np.concatenate((
+            np.arange(startIdx, T),
+            np.arange(0, stopIdx)
+        ))
+
+    valIndices = np.setdiff1d(np.arange(T), trainIndices)
+
+    return data[:, trainIndices], data[:, valIndices]
+
+def plot_gaussian_hmm_data(hmm, params, emissions, emissionNames, states, xlim=None):
+    """"Adapted from dynamax notebook"""
+    num_timesteps = len(emissions)
+    emission_dim = hmm.emission_dim
+    lim = 1.05 * abs(emissions).max()
+
+    # Plot the data superimposed on the generating state sequence
+    fig, axs = plt.subplots(emission_dim, 1, sharex=True)
+    
+    for d in range(emission_dim):    
+        if emission_dim==1:
+            ax = axs
+        else:
+            ax = axs[d]
+        ax.imshow(states[None, :], aspect="auto", interpolation="none", cmap=CMAP,
+                      vmin=0, vmax=len(COLORS) - 1, extent=(0, num_timesteps, -lim, lim))
+        ax.plot(emissions[:, d], "-k")
+        ax.set_ylabel(emissionNames[d], size=6)
+
+    if emission_dim > 1:
+        axs[-1].set_xlabel("time")
+    else:
+        axs.set_xlabel("time")
+    plt.tight_layout()
+    plt.show()
+
+def predictEmissions(emissions, inputs, model, params):
+    def calc(params, z, i):
+        return params.emissions.weights[z] @ i + params.emissions.biases[z]
+    y_preds = []
+    z_seqs = []
+    for btch in range(len(emissions)):
+        z_seq = model.most_likely_states(
+            params, emissions[btch], inputs[btch]
+        )  # inferred states
+        y_pred = vmap(partial(calc, params))(
+            z_seq, inputs[btch]
+        )  # inferred y given z
+        y_preds.append(y_pred)
+        z_seqs.append(z_seq)
+        # print(btch, y_pred.shape)
+    y_preds = np.array(y_preds)
+    z_seqs = np.array(z_seqs)
+    return y_preds, z_seqs
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-I1qiIy/python-FOiaH8
+* define global variables (analysis directory)
+#+NAME: rootDir
+#+BEGIN_SRC emacs-lisp
+;; "/Users/mjaragon/Desktop/brain_analysis_data/functional/20240620/201/"
+"/Users/mjaragon/Desktop/brain_analysis_data/"
+#+END_SRC
+
+#+RESULTS: rootDir
+: /Users/mjaragon/Desktop/brain_analysis_data/
+
+#+RESULTS: expDir
+: /Users/mjaragon/Desktop/brain_analysis_data/functional/
+* load data 
+#+BEGIN_SRC python :session session_dynamax :async :tangle yes :var rootDir=rootDir :eval
+if "src.utils.data_loading" in sys.modules:
+    del sys.modules["src.utils.data_loading"]
+    from src.utils.data_loading import loadSupervoxelData
+
+if "src.utils.regression" in sys.modules:
+    del sys.modules["src.utils.regression"]
+    from src.utils.regression import makeRegressionData
+
+if "src.utils.fictrac" in sys.modules:
+    del sys.modules["src.utils.fictrac"]
+    from src.utils.fictrac import mergeBouts
+
+nPCs = 2
+
+# grab experiment directories
+funcDirs = glob.glob(rootDir + "/**/*_func", recursive=True)
+expDirs = [str(Path(p).parents[0]) for p in funcDirs]
+
+# create h5 dataset
+h5Path = rootDir + "/regression_dataset.h5"
+if os.path.exists(h5Path):
+    os.remove(h5Path)
+    h5Dataset = h5py.File(h5Path, "w")
+    h5Dataset.create_group("regression_data")
+    h5Dataset.create_group("activity")
+
+# bad experiments
+badExperiments = [
+    "20240606_101_func",
+    "20240606_202_func",
+    "20240606_102_func",
+    "20240618_201_func",
+    "20240618_101_func",
+    "20240618_102_func",
+    "20240612_201_func",
+    "20240623_201_func",
+    "20240617_401_func",
+    "20240617_201_func",
+    "20240609_101_func",
+    "20240610_201_func",
+    "20240610_101_func",
+]
+
+goodExperiments = [
+    "20240623_101_func",
+    "20240625_101_func",
+    "20240610_101_func",
+    "20240530_201_func",
+    "20240620_201_func",
+    "20240617_201_func",
+]
+
+for expDir in tqdm(expDirs):
+    expStr = "_".join(expDir.split("/")[-2:]) + "_func"
+    if expStr not in goodExperiments:
+        continue
+
+    h5Dataset["regression_data"].create_group(expStr)
+
+    # load neural data
+    allNeuralData, idxToROI, roiToIdx = loadSupervoxelData(
+        expDir, channel=1, getRaw=False
+    )
+
+    # load behavioral data
+    flyvrData = loadFlyVRData(expDir)  # behavioral data
+    fsav = getFictracSampsAtVolume(flyvrData)  # fictrac samples for each imaging volume
+    regressionData = makeRegressionData(
+        flyvrData=flyvrData,
+        cnnData=None,
+        fictracTimestamps=fsav,
+        featureList=[
+            "mfDistZ",
+            "sideSideZ",
+            "turnBoutsAll",
+        ],
+    )
+
+    # do pca on data
+    pca = PCA(n_components=nPCs)
+    pca.fit(allNeuralData.T)
+    components = pca.components_.T  # T x nPCs
+
+    # get pc loadings
+    loadings = pca.components_.T * np.sqrt(pca.explained_variance_)
+
+    # set sign of each PC s.t. mean of loadings is positive
+    pcProj = []
+    for i in range(nPCs):
+        pc = components[:, i].copy()  # grab pc
+        if np.mean(loadings[:, i]) < 0:
+            pc *= -1  # flip sign if necessary
+        transformed = zscore(allNeuralData.T @ pc.T)  # data projected onto pc
+        pcProj.append(transformed)
+
+    # update dataset
+    for key in regressionData:
+        h5Dataset["regression_data"][expStr].create_dataset(
+            key, data=regressionData[key]
+        )
+    h5Dataset["activity"].create_dataset(expStr, data=pcProj)
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-I1qiIy/python-EB52xT
+
+* ssm modeling
+** format data for model fitting 
+#+BEGIN_SRC python :session session_dynamax :async :tangle yes 
+h5Dataset = h5py.File(
+    "/Users/mjaragon/Desktop/brain_analysis_data/regression_dataset.h5", "r"
+)
+
+# format data to (batches x time x emission_dim)
+allEmissions = []
+allInputs = []
+
+for key in h5Dataset["regression_data"]:
+    featData = h5Dataset["regression_data"][key]  # regression inputs
+    activityData = list(h5Dataset["activity"][key])  # activity data
+    inputs = np.vstack(
+        [
+            featData["mfDistZ"],
+            featData["sideSideZ"],
+            featData["turnBoutsAll"],
+        ]
+    ).T
+    allEmissions.append(activityData)
+    allInputs.append(inputs)
+
+# only keep session_dynamaxs that last >= ten minutes
+minLen = 1800
+emissionsC = allEmissions.copy()
+allEmissions = np.array([np.array(e)[:minLen] for e in allEmissions if len(e) > minLen])[
+    ..., None
+]  # dummy nEmissions dimension
+allInputs = np.array(
+    [np.array(i)[:minLen] for i, e in zip(allInputs, emissionsC) if len(e) > minLen]
+)
+print(allEmissions.shape)
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-I1qiIy/python-DVxx5u
+
+** select number of states
+*** run cross validation
+#+BEGIN_SRC python :session session_dynamax :async :tangle yes 
+# instantiate model
+nFolds = 6
+nBatches, nT, nEmissions = allEmissions.shape
+nBatches, nT, nInputs = allInputs.shape
+allLPs = {}
+allR2s = {}
+
+for nStates in np.arange(2, 10):
+    lpVals = []
+    r2Scores = []
+
+    for fold in range(nFolds):
+        trainEmissions, valEmissions = splitTrainVal(allEmissions, seed = fold, trainFrac=0.6)
+        trainInputs, valInputs = splitTrainVal(allInputs, seed = fold, trainFrac=0.6)
+
+        # fit model
+        model = LinearRegressionHMM(
+            num_states=nStates, input_dim=nInputs, emission_dim=nEmissions, transition_matrix_stickiness=10.0,
+        )
+        params, props = model.initialize(key=jr.PRNGKey(1))
+        fit_params, lps = model.fit_em(params, props, trainEmissions, inputs=trainInputs)
+
+        # get performance on held-out data 
+        lpVal = []
+
+        for i in range(len(trainEmissions)): 
+            # marginal log prob
+            lpVal.append(model.marginal_log_prob(fit_params, emissions=valEmissions[i], inputs=valInputs[i]))
+
+        # r^2 value averaged across sessions 
+        preds, _ = predictEmissions(valEmissions, valInputs, model, params)  # predictions on validation data
+        r2 = []
+
+	# compute r^2 value for each session
+        for s in range(len(preds)):
+            trueEmission = valEmissions[s]
+            pred = preds[s]
+            r2.append(r2_score(trueEmission, pred))
+        r2 = np.mean(r2)  # average coef. of determination across sessions 
+        lpVals.append(np.nanmean(lpVal))
+        r2Scores.append(r2)
+    allLPs[f"# states={nStates}"] = lpVals
+    allR2s[f"# states={nStates}"] = r2Scores
+#+END_SRC
+
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-I1qiIy/python-fqVgWf
+*** plot results
+#+BEGIN_SRC python :session session_dynamax :async :tangle yes 
+fig, ax = plt.subplots(1, 2)
+sns.boxplot(data=allLPs, ax=ax[0])
+sns.swarmplot(data=allLPs, color="black", ax=ax[0])
+sns.boxplot(data=allR2s, ax=ax[1])
+sns.swarmplot(data=allR2s, color="black", ax=ax[1])
+ax[0].set_ylabel("log probability")
+ax[1].set_ylabel(r"$r^2$")
+sns.despine(ax=ax[0])
+sns.despine(ax=ax[1])
+xlbl = ax[0].get_xticklabels()
+ax[0].set_xticklabels(labels=xlbl, rotation=45, size=6)
+ax[1].set_xticklabels(labels=xlbl, rotation=45, size=6)
+plt.suptitle("performance on validation data")
+plt.tight_layout()
+plt.show()
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-I1qiIy/python-MgbFFE
+** show results for model w/ best hyperparams
+#+BEGIN_SRC python :session session_dynamax :async :tangle yes 
+# fit model
+nStates = 4
+nBatches, nT, nEmissions = allEmissions.shape
+nBatches, nT, nInputs = allInputs.shape
+model = LinearRegressionHMM(
+    num_states=nStates,
+    input_dim=nInputs,
+    emission_dim=nEmissions,
+    transition_matrix_stickiness=10.0,
+)
+params, props = model.initialize(key=jr.PRNGKey(1))
+fit_params, lps = model.fit_em(params, props, emissions=allEmissions, inputs=allInputs)
+
+# plot states
+expIdx = 1
+emissionNames = ["PC1"]
+most_likely_states = model.most_likely_states(
+    params, emissions=allEmissions[expIdx], inputs=allInputs[expIdx]
+)
+plot_gaussian_hmm_data(
+    model, params, allEmissions[expIdx], emissionNames, most_likely_states
+)
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-I1qiIy/python-6TeNcX
+** r^2 example
+#+BEGIN_SRC python :session session_dynamax :async :tangle yes 
+preds = predictEmissions(allEmissions, allInputs, model, params)
+expID = 1
+lim = 1.05 * abs(allEmissions[expID]).max()
+fig, ax = plt.subplots()
+ax.plot(allEmissions[expID], c="k")
+ax.plot(preds[0][expID], c="w")
+ax.imshow(
+    preds[1][expID][None],
+    aspect="auto",
+    extent=(0, 1800, -lim, lim),
+    cmap=CMAP,
+    vmin=0,
+    vmax=len(COLORS),
+    interpolation=None,
+)
+plt.show()
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-I1qiIy/python-SQWpVi
+** analyze weights
+#+BEGIN_SRC python :session session_dynamax :async :tangle yes 
+weights = np.array(fit_params.emissions.weights)  # nStates x nEmissions x nInputs
+maxW = np.max([abs(np.min(weights)), abs(np.max(weights))])
+weightsZ = zscore(np.array(fit_params.emissions.weights), axis=None)  # nStates x nEmissions x nInputs
+outputNames = ["PC1"]
+inputNames = ["mfDist", "sideSide", "turn"]
+nRows = 2
+nCols = nStates//2 if nStates%2==0 else nStates//2 + 1
+
+fig, ax = plt.subplots(2, nCols)
+for i in range(nStates):
+    idx = np.unravel_index(i, (2, nCols))
+    ax[idx].set_xticks(np.arange(len(inputNames)))
+    ax[idx].set_yticks(np.arange(len(outputNames)))
+    # ax[idx].imshow(zscore(weights[i], axis=None, nan_policy="omit"), cmap="coolwarm", vmin=-3, vmax=3)
+    ax[idx].imshow(weights[i], cmap="coolwarm", vmin=-maxW, vmax=maxW)
+    ax[idx].set_xticklabels(inputNames, rotation=45, size=8)
+    ax[idx].set_yticklabels(outputNames, rotation=45, size=8)
+    ax[idx].set_title(f"state = {i + 1}")
+
+plt.tight_layout()
+plt.show()
+#+END_SRC
+
+#+RESULTS:
+: /var/folders/sg/b_llh9y104zb2cmjb8whvgl00000gp/T/babel-I1qiIy/python-mN55KF
